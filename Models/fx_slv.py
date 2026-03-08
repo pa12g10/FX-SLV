@@ -85,6 +85,67 @@ class FXStochasticLocalVol:
         expiry_set = sorted(set(expiries))
         strike_set = sorted(set(strikes))
         
+        print(f"\nBuilding vol surface with {len(strike_set)} strikes and {len(expiry_set)} expiries")
+        print(f"Strikes: {strike_set}")
+        print(f"Expiries: {expiry_set}")
+        
+        # QuantLib requires at least 2 points in each dimension for interpolation
+        if len(expiry_set) < 2:
+            # Add a nearby expiry point
+            if len(expiry_set) == 1:
+                base_expiry = expiry_set[0]
+                # Add a point 1 day before (or after if at start)
+                new_expiry = base_expiry + 0.01 if base_expiry > 0.01 else base_expiry + 0.01
+                expiry_set.append(new_expiry)
+                expiry_set = sorted(expiry_set)
+                
+                # Duplicate volatilities for new expiry
+                for strike in strike_set:
+                    # Find vol for this strike at base expiry
+                    matching_vol = None
+                    for i in range(len(strikes)):
+                        if abs(strikes[i] - strike) < 1e-6 and abs(expiries[i] - base_expiry) < 1e-6:
+                            matching_vol = vols[i]
+                            break
+                    
+                    if matching_vol:
+                        strikes = np.append(strikes, strike)
+                        expiries = np.append(expiries, new_expiry)
+                        vols = np.append(vols, matching_vol)
+                
+                print(f"⚠️  Warning: Only 1 expiry found. Added synthetic expiry at {new_expiry:.4f}Y")
+        
+        if len(strike_set) < 2:
+            # Add a nearby strike point
+            if len(strike_set) == 1:
+                base_strike = strike_set[0]
+                # Add a strike 1% away
+                new_strike = base_strike * 1.01
+                strike_set.append(new_strike)
+                strike_set = sorted(strike_set)
+                
+                # Duplicate volatilities for new strike
+                for expiry in expiry_set:
+                    # Find vol for this expiry at base strike
+                    matching_vol = None
+                    for i in range(len(strikes)):
+                        if abs(expiries[i] - expiry) < 1e-6 and abs(strikes[i] - base_strike) < 1e-6:
+                            matching_vol = vols[i]
+                            break
+                    
+                    if matching_vol:
+                        strikes = np.append(strikes, new_strike)
+                        expiries = np.append(expiries, expiry)
+                        vols = np.append(vols, matching_vol)
+                
+                print(f"⚠️  Warning: Only 1 strike found. Added synthetic strike at {new_strike:.4f}")
+        
+        # Rebuild sets after potential additions
+        expiry_set = sorted(set(expiries))
+        strike_set = sorted(set(strikes))
+        
+        print(f"Final grid: {len(strike_set)} strikes × {len(expiry_set)} expiries")
+        
         expiry_dates_unique = [self.eval_date + ql.Period(int(e*365), ql.Days) for e in expiry_set]
         
         # Build vol matrix (strikes x expiries)
