@@ -58,6 +58,9 @@ class FXCurves:
             calendar
         )
         
+        # Enable extrapolation to handle times beyond max curve time
+        self.domestic_curve.enableExtrapolation()
+        
         self.domestic_curve_handle = ql.YieldTermStructureHandle(self.domestic_curve)
         
         # Build foreign curve
@@ -72,6 +75,9 @@ class FXCurves:
             calendar
         )
         
+        # Enable extrapolation to handle times beyond max curve time
+        self.foreign_curve.enableExtrapolation()
+        
         self.foreign_curve_handle = ql.YieldTermStructureHandle(self.foreign_curve)
         
         return self.domestic_curve_handle, self.foreign_curve_handle
@@ -82,7 +88,7 @@ class FXCurves:
         
         Parameters:
         -----------
-        times : list
+        times : list or array
             List of times in years
         
         Returns:
@@ -99,7 +105,7 @@ class FXCurves:
     
     def get_forward_fx(self, spot_fx, time):
         """
-        Calculate forward FX rate
+        Calculate forward FX rate using covered interest rate parity
         
         Parameters:
         -----------
