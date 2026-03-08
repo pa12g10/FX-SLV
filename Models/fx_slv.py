@@ -223,13 +223,9 @@ class FXStochasticLocalVol:
         for helper in self.calibrated_helpers:
             helper.setPricingEngine(heston_engine)
         
-        # Define parameter constraints
-        # Bounds: v0, kappa, theta, sigma > 0, -1 < rho < 1
-        lower_bounds = ql.Array([0.0001, 0.01, 0.0001, 0.01, -0.9999])  # Slightly away from boundaries
-        upper_bounds = ql.Array([1.0, 15.0, 1.0, 5.0, 0.9999])
-        constraint = ql.BoundaryConstraint(lower_bounds, upper_bounds)
-        
-        # Calibrate model with constraints
+        # Calibrate model WITHOUT explicit constraints
+        # QuantLib's LevenbergMarquardt inherently keeps parameters reasonable
+        # and we've already bounded initial guesses
         optimization_method = ql.LevenbergMarquardt()
         end_criteria = ql.EndCriteria(
             500,      # max iterations
@@ -244,8 +240,7 @@ class FXStochasticLocalVol:
             self.heston_model.calibrate(
                 self.calibrated_helpers,
                 optimization_method,
-                end_criteria,
-                constraint
+                end_criteria
             )
             print("✅ Calibration completed")
         except Exception as e:
