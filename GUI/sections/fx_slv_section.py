@@ -225,27 +225,42 @@ def render_fx_slv_section():
             try:
                 # Filter volatility surface based on calibration mode
                 if calibration_mode == "ATM Only (Recommended)":
+                    # Get unique expiries
+                    unique_expiries = sorted(vol_surface_df['Expiry (Years)'].unique())
+                    
                     # Select ATM options only (strike closest to spot)
                     atm_options = []
-                    for expiry in vol_surface_df['Expiry (Years)'].unique():
-                        expiry_data = vol_surface_df[vol_surface_df['Expiry (Years)'] == expiry]
-                        # Find strike closest to spot
-                        atm_row = expiry_data.iloc[(expiry_data['Strike'] - spot_fx).abs().argmin()]
-                        atm_options.append(atm_row)
+                    for expiry in unique_expiries:
+                        expiry_data = vol_surface_df[vol_surface_df['Expiry (Years)'] == expiry].copy()
+                        if len(expiry_data) > 0:
+                            # Find strike closest to spot
+                            idx_min = (expiry_data['Strike'] - spot_fx).abs().argmin()
+                            atm_row = expiry_data.iloc[idx_min]
+                            atm_options.append({
+                                'Strike': atm_row['Strike'],
+                                'Expiry (Years)': atm_row['Expiry (Years)'],
+                                'Volatility (%)': atm_row['Volatility (%)']
+                            })
                     
                     calibration_df = pd.DataFrame(atm_options)
-                    st.info(f"🎯 Calibrating to {len(calibration_df)} ATM options")
+                    
+                    # Validate we have enough options
+                    if len(calibration_df) < 2:
+                        st.error(f"❌ Need at least 2 ATM options for calibration, found {len(calibration_df)}. Please check your volatility surface.")
+                        st.stop()
+                    
+                    st.info(f"🎯 Calibrating to {len(calibration_df)} ATM options: {unique_expiries}")
                 else:
-                    calibration_df = vol_surface_df
+                    calibration_df = vol_surface_df.copy()
                     st.info(f"🎯 Calibrating to {len(calibration_df)} options (full surface)")
                 
                 # Prepare volatility surface data
                 vol_surface_data = []
                 for _, row in calibration_df.iterrows():
                     vol_surface_data.append([
-                        row['Strike'],
-                        row['Expiry (Years)'],
-                        row['Volatility (%)'] / 100  # Convert to decimal
+                        float(row['Strike']),
+                        float(row['Expiry (Years)']),
+                        float(row['Volatility (%)']) / 100  # Convert to decimal
                     ])
                 
                 # Model parameters
