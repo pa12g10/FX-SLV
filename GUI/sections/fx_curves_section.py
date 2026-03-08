@@ -21,6 +21,8 @@ from MarketData import (
     get_ccy_swaps_data
 )
 
+from Models import FXCurves
+
 try:
     import QuantLib as ql
 except ImportError:
@@ -358,22 +360,249 @@ def render_fx_curves_section():
     st.markdown("---")
     
     # ========================
-    # SECTION 7: Bootstrap Curves (Placeholder)
+    # SECTION 7: Bootstrap Curves
     # ========================
     st.subheader("⚙️ Curve Bootstrapping")
     
     st.info("""
-    **Next Step: Curve Construction**
+    **Curve Construction Process:**
     
-    The market data above will be used to bootstrap:
-    1. **USD SOFR Curve** - Using deposits, futures, and OIS swaps
-    2. **EUR ESTR Curve** - Using deposits, futures, and OIS swaps  
-    3. **FX Forward Curve** - From covered interest parity with FX forwards
-    4. **CCY Basis Curve** - Incorporating cross-currency basis spreads
-    
-    Click the button below to proceed with curve construction.
+    1. **USD SOFR Curve** - Bootstrap from deposits, futures, and OIS swaps
+    2. **EUR ESTR Curve** - Bootstrap from deposits, futures, and OIS swaps  
+    3. **FX Forward Curve** - Calculate using covered interest parity
+    4. **CCY Basis Curve** - Incorporate cross-currency basis spreads
     """)
     
+    # Initialize session state
+    if 'fx_curves' not in st.session_state:
+        st.session_state.fx_curves = None
+    
     if st.button("🚀 Bootstrap All Curves", type="primary", use_container_width=True):
-        st.warning("Curve bootstrapping functionality will be implemented in the next section.")
-        st.info("This will use the Pricing modules (DepositPricer, FuturesPricer, SwapPricer, etc.) to build yield curves.")
+        with st.spinner("Bootstrapping yield curves..."):
+            try:
+                # Create FX curves object
+                fx_curves = FXCurves(eval_date)
+                
+                # Bootstrap domestic curves (SOFR and ESTR)
+                with st.expander("📊 Bootstrapping Domestic Curves", expanded=True):
+                    output_container = st.empty()
+                    
+                    # Capture console output
+                    import io
+                    from contextlib import redirect_stdout
+                    
+                    output_buffer = io.StringIO()
+                    with redirect_stdout(output_buffer):
+                        fx_curves.bootstrap_domestic_curves()
+                    
+                    output_container.code(output_buffer.getvalue())
+                
+                # Bootstrap basis curve
+                with st.expander("🔄 Bootstrapping CCY Basis Curve", expanded=True):
+                    output_container = st.empty()
+                    
+                    output_buffer = io.StringIO()
+                    with redirect_stdout(output_buffer):
+                        fx_curves.bootstrap_basis_curve()
+                    
+                    output_container.code(output_buffer.getvalue())
+                
+                # Store in session state
+                st.session_state.fx_curves = fx_curves
+                
+                st.success("✅ All curves bootstrapped successfully!")
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"❌ Bootstrapping failed: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
+    
+    # ========================
+    # SECTION 8: Bootstrapped Results
+    # ========================
+    if st.session_state.fx_curves is not None:
+        st.markdown("---")
+        st.header("🎉 Bootstrapped Curve Results")
+        
+        fx_curves = st.session_state.fx_curves
+        
+        # Create tabs for results
+        results_tab1, results_tab2, results_tab3, results_tab4 = st.tabs([
+            "📉 Zero Rates",
+            "💰 Discount Factors",
+            "📈 Forward FX Curve",
+            "📊 Basis Curve"
+        ])
+        
+        with results_tab1:
+            st.subheader("Zero Rate Curves")
+            
+            # Get zero rates
+            zero_df = fx_curves.get_zero_rate_summary()
+            st.dataframe(zero_df, use_container_width=True, hide_index=True)
+            
+            # Plot
+            fig_zeros = go.Figure()
+            
+            fig_zeros.add_trace(go.Scatter(
+                x=zero_df['Tenor (Years)'],
+                y=zero_df['USD SOFR (%)'],
+                mode='lines+markers',
+                name='USD SOFR',
+                line=dict(width=3, color='blue'),
+                marker=dict(size=8)
+            ))
+            
+            fig_zeros.add_trace(go.Scatter(
+                x=zero_df['Tenor (Years)'],
+                y=zero_df['EUR ESTR (%)'],
+                mode='lines+markers',
+                name='EUR ESTR',
+                line=dict(width=3, color='red'),
+                marker=dict(size=8)
+            ))
+            
+            fig_zeros.update_layout(
+                title="Bootstrapped Zero Rate Curves",
+                xaxis_title="Tenor (Years)",
+                yaxis_title="Zero Rate (%)",
+                height=600,
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig_zeros, use_container_width=True)
+        
+        with results_tab2:
+            st.subheader("Discount Factor Curves")
+            
+            # Get discount factors
+            df_summary = fx_curves.get_discount_factor_summary()
+            st.dataframe(df_summary, use_container_width=True, hide_index=True)
+            
+            # Plot
+            fig_dfs = go.Figure()
+            
+            fig_dfs.add_trace(go.Scatter(
+                x=df_summary['Tenor (Years)'],
+                y=df_summary['USD DF'],
+                mode='lines+markers',
+                name='USD DF',
+                line=dict(width=3, color='blue'),
+                marker=dict(size=8)
+            ))
+            
+            fig_dfs.add_trace(go.Scatter(
+                x=df_summary['Tenor (Years)'],
+                y=df_summary['EUR DF'],
+                mode='lines+markers',
+                name='EUR DF',
+                line=dict(width=3, color='red'),
+                marker=dict(size=8)
+            ))
+            
+            fig_dfs.update_layout(
+                title="Discount Factor Curves",
+                xaxis_title="Tenor (Years)",
+                yaxis_title="Discount Factor",
+                height=600,
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig_dfs, use_container_width=True)
+        
+        with results_tab3:
+            st.subheader("FX Forward Curve (with Basis Adjustment)")
+            
+            # Get forward curve
+            tenors = np.linspace(0.25, 10, 40)
+            forward_curve = fx_curves.get_forward_curve(tenors)
+            
+            st.dataframe(forward_curve.head(20), use_container_width=True, hide_index=True)
+            
+            # Plot
+            fig_fwd_curve = go.Figure()
+            
+            fig_fwd_curve.add_trace(go.Scatter(
+                x=forward_curve['Tenor (Years)'],
+                y=forward_curve['Standard Forward'],
+                mode='lines',
+                name='Standard Forward (no basis)',
+                line=dict(width=2, color='gray', dash='dash')
+            ))
+            
+            fig_fwd_curve.add_trace(go.Scatter(
+                x=forward_curve['Tenor (Years)'],
+                y=forward_curve['Adjusted Forward'],
+                mode='lines+markers',
+                name='Basis-Adjusted Forward',
+                line=dict(width=3, color='green'),
+                marker=dict(size=6)
+            ))
+            
+            fig_fwd_curve.add_hline(
+                y=fx_curves.spot_fx,
+                line_dash="dot",
+                line_color="black",
+                annotation_text=f"Spot: {fx_curves.spot_fx:.4f}"
+            )
+            
+            fig_fwd_curve.update_layout(
+                title="EUR/USD Forward Curve (Basis-Adjusted)",
+                xaxis_title="Tenor (Years)",
+                yaxis_title="FX Rate",
+                height=600,
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig_fwd_curve, use_container_width=True)
+        
+        with results_tab4:
+            st.subheader("Cross-Currency Basis Curve")
+            
+            # Plot basis impact
+            fig_basis_impact = go.Figure()
+            
+            fig_basis_impact.add_trace(go.Scatter(
+                x=forward_curve['Tenor (Years)'],
+                y=forward_curve['Basis (bps)'],
+                mode='lines+markers',
+                name='Basis Spread',
+                line=dict(width=3, color='orange'),
+                marker=dict(size=8),
+                yaxis='y1'
+            ))
+            
+            fig_basis_impact.add_trace(go.Scatter(
+                x=forward_curve['Tenor (Years)'],
+                y=forward_curve['Basis Impact (pips)'],
+                mode='lines+markers',
+                name='Basis Impact on Forward',
+                line=dict(width=3, color='purple'),
+                marker=dict(size=8),
+                yaxis='y2'
+            ))
+            
+            fig_basis_impact.update_layout(
+                title="CCY Basis and Impact on FX Forwards",
+                xaxis_title="Tenor (Years)",
+                yaxis_title="Basis Spread (bps)",
+                yaxis2=dict(
+                    title="Impact on Forward (pips)",
+                    overlaying='y',
+                    side='right'
+                ),
+                height=600,
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig_basis_impact, use_container_width=True)
+            
+            st.info("""
+            **Basis Impact Interpretation:**
+            - Negative basis widens the EUR/USD forward (EUR cheaper to fund)
+            - Impact grows with tenor as basis accrues over time
+            - Typical EUR/USD basis: -10 to -20 bps
+            """)
+    else:
+        st.info("👆 Click 'Bootstrap All Curves' above to see bootstrapped results")
