@@ -68,17 +68,26 @@ class YieldCurveBuilder:
         )
         self.helpers.append(deposit_helper)
         
-        # 2. Add Futures Helpers
-        print(f"\nAdding {len(futures_data)} futures contracts:")
+        # 2. Add Futures Helpers (only up to 1Y to avoid overlap with 2Y swap)
+        print(f"\nAdding futures contracts (filtering to avoid overlap):")
+        futures_added = 0
         for idx, row in futures_data.iterrows():
-            print(f"  {row['maturity']}: {row['price']:.2f} (implied: {row['rate']:.2f}%)")
-            
-            futures_helper = self.futures_pricer.create_helper(
-                maturity=row['maturity'],
-                price=row['price'],
-                day_count=row['day_count']
-            )
-            self.helpers.append(futures_helper)
+            # Only add futures up to 1Y maturity
+            # This avoids overlap with 2Y swaps
+            if self._parse_tenor_to_years(row['maturity']) <= 1.0:
+                print(f"  {row['maturity']}: {row['price']:.2f} (implied: {row['rate']:.2f}%)")
+                
+                futures_helper = self.futures_pricer.create_helper(
+                    maturity=row['maturity'],
+                    price=row['price'],
+                    day_count=row['day_count']
+                )
+                self.helpers.append(futures_helper)
+                futures_added += 1
+            else:
+                print(f"  {row['maturity']}: SKIPPED (would overlap with swaps)")
+        
+        print(f"Added {futures_added} futures contracts")
         
         # 3. Add Swap Helpers
         # For swaps, we need a preliminary curve handle for the swap pricer
@@ -123,7 +132,7 @@ class YieldCurveBuilder:
             
             print(f"✅ {self.currency} curve bootstrapped successfully!")
             print(f"   Number of nodes: {len(self.helpers)}")
-            print(f"   Max maturity: {self._get_max_maturity()} years")
+            print(f"   Max maturity: {self._get_max_maturity():.1f} years")
             
             # Print some sample rates
             print(f"\nSample Zero Rates:")
@@ -139,6 +148,21 @@ class YieldCurveBuilder:
         except Exception as e:
             print(f"❌ Curve bootstrapping failed: {e}")
             raise
+    
+    def _parse_tenor_to_years(self, tenor_str):
+        """
+        Parse tenor string to years
+        """
+        tenor_str = tenor_str.upper().strip()
+        
+        if tenor_str.endswith('M'):
+            months = int(tenor_str[:-1])
+            return months / 12.0
+        elif tenor_str.endswith('Y'):
+            years = int(tenor_str[:-1])
+            return float(years)
+        else:
+            return 0.0
     
     def _get_max_maturity(self):
         """
