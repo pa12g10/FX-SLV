@@ -152,17 +152,17 @@ def render_fx_slv_section():
     st.write("**Calibration Settings**")
     calibration_mode = st.radio(
         "Calibration Mode",
-        options=["ATM Only (Recommended)", "Full Surface"],
+        options=["Reduced Set (Recommended)", "Full Surface"],
         index=0,
-        help="ATM Only: Calibrates to 4 ATM options only (better fit, faster). Full Surface: Uses all strikes (may overfit).",
+        help="Reduced Set: Uses 8 carefully selected options (ATM + wings for key expiries). Full Surface: Uses all 20 options.",
         horizontal=True,
         key="fx_slv_calib_mode"
     )
     
-    if calibration_mode == "ATM Only (Recommended)":
-        st.success("✅ ATM-only calibration provides better quality with 5 Heston parameters. Expected RMSE: < 20 bps")
+    if calibration_mode == "Reduced Set (Recommended)":
+        st.success("✅ Reduced set calibration uses 8 options (ATM + near-strikes) for optimal fit. Expected RMSE: < 20 bps")
     else:
-        st.warning("⚠️ Full surface calibration with 20 options may result in larger errors (RMSE > 30 bps)")
+        st.warning("⚠️ Full surface calibration with 20 options may result in larger errors (RMSE > 30 bps) due to overfitting")
     
     st.write("**Initial Parameter Guesses (FX-typical values)**")
     
@@ -224,32 +224,59 @@ def render_fx_slv_section():
         with st.spinner("Calibrating FX-SLV model to volatility surface..."):
             try:
                 # Filter volatility surface based on calibration mode
-                if calibration_mode == "ATM Only (Recommended)":
-                    # Get unique expiries
+                if calibration_mode == "Reduced Set (Recommended)":
+                    # Strategy: Select ATM + wings (strike above and below) for 2 shortest expiries
+                    # This gives ~6-8 options depending on surface
                     unique_expiries = sorted(vol_surface_df['Expiry (Years)'].unique())
                     
-                    # Select ATM options only (strike closest to spot)
-                    atm_options = []
-                    for expiry in unique_expiries:
+                    selected_options = []
+                    
+                    # For first 2 expiries: ATM + 1 wing above + 1 wing below = 3 options each = 6 total
+                    # For remaining expiries: ATM only
+                    for idx, expiry in enumerate(unique_expiries[:2]):  # First 2 expiries
                         expiry_data = vol_surface_df[vol_surface_df['Expiry (Years)'] == expiry].copy()
                         if len(expiry_data) > 0:
-                            # Find strike closest to spot
+                            expiry_data = expiry_data.sort_values('Strike')
+                            strikes_sorted = expiry_data['Strike'].values
+                            
+                            # Find ATM index
+                            atm_idx = np.argmin(np.abs(strikes_sorted - spot_fx))
+                            
+                            # Select ATM + neighbors
+                            indices_to_select = [atm_idx]
+                            if atm_idx > 0:  # Add below
+                                indices_to_select.insert(0, atm_idx - 1)
+                            if atm_idx < len(strikes_sorted) - 1:  # Add above
+                                indices_to_select.append(atm_idx + 1)
+                            
+                            for i in indices_to_select:
+                                row = expiry_data.iloc[i]
+                                selected_options.append({
+                                    'Strike': row['Strike'],
+                                    'Expiry (Years)': row['Expiry (Years)'],
+                                    'Volatility (%)': row['Volatility (%)']
+                                })
+                    
+                    # For remaining expiries: add just ATM
+                    for expiry in unique_expiries[2:]:
+                        expiry_data = vol_surface_df[vol_surface_df['Expiry (Years)'] == expiry].copy()
+                        if len(expiry_data) > 0:
                             idx_min = (expiry_data['Strike'] - spot_fx).abs().argmin()
                             atm_row = expiry_data.iloc[idx_min]
-                            atm_options.append({
+                            selected_options.append({
                                 'Strike': atm_row['Strike'],
                                 'Expiry (Years)': atm_row['Expiry (Years)'],
                                 'Volatility (%)': atm_row['Volatility (%)']
                             })
                     
-                    calibration_df = pd.DataFrame(atm_options)
+                    calibration_df = pd.DataFrame(selected_options)
                     
-                    # Validate we have enough options
-                    if len(calibration_df) < 2:
-                        st.error(f"❌ Need at least 2 ATM options for calibration, found {len(calibration_df)}. Please check your volatility surface.")
+                    # Validate we have enough options (need at least 5 for 5 Heston parameters)
+                    if len(calibration_df) < 5:
+                        st.error(f"❌ Need at least 5 options for calibration (5 Heston parameters), found {len(calibration_df)}. Please add more data.")
                         st.stop()
                     
-                    st.info(f"🎯 Calibrating to {len(calibration_df)} ATM options: {unique_expiries}")
+                    st.info(f"🎯 Calibrating to {len(calibration_df)} selected options (ATM + wings for short expiries)")
                 else:
                     calibration_df = vol_surface_df.copy()
                     st.info(f"🎯 Calibrating to {len(calibration_df)} options (full surface)")
@@ -356,7 +383,7 @@ def render_fx_slv_section():
                     quality_msg = "⚠️ Acceptable calibration (RMSE < 30 bps)"
                     quality_color = "orange"
                 else:
-                    quality_msg = "❌ Poor calibration (RMSE > 30 bps). Try ATM-only mode."
+                    quality_msg = "❌ Poor calibration (RMSE > 30 bps). Try reduced set mode."
                     quality_color = "red"
                 
                 st.markdown(f":{quality_color}[**{quality_msg}**]")
