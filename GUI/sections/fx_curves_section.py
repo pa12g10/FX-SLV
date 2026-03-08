@@ -166,7 +166,7 @@ def render_fx_curves_section():
         st.plotly_chart(fig_estr_fut, use_container_width=True)
     
     with estr_tab3:
-        st.write("**ESTR OIS Swaps (2Y - 30Y)**"")
+        st.write("**ESTR OIS Swaps (2Y - 30Y)**")
         swaps_data = get_estr_swaps_data()
         
         st.dataframe(swaps_data, use_container_width=True, hide_index=True)
