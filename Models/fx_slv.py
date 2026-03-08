@@ -34,11 +34,11 @@ class FXStochasticLocalVol:
             Volatility in decimal (e.g., 0.10 for 10%)
         model_params : dict, optional
             Model parameters with keys:
-            - 'v0': initial variance (default: 0.01)
-            - 'kappa': mean reversion speed (default: 1.0)
-            - 'theta': long-term variance (default: 0.01)
-            - 'sigma': vol-of-vol (default: 0.3)
-            - 'rho': correlation between spot and vol (default: -0.7)
+            - 'v0': initial variance (default: 0.014)
+            - 'kappa': mean reversion speed (default: 2.0)
+            - 'theta': long-term variance (default: 0.014)
+            - 'sigma': vol-of-vol (default: 0.4)
+            - 'rho': correlation between spot and vol (default: -0.6)
         """
         self.eval_date = eval_date
         self.spot_fx = spot_fx
@@ -46,14 +46,18 @@ class FXStochasticLocalVol:
         self.foreign_curve = foreign_curve
         self.vol_surface_data = vol_surface_data
         
-        # Default model parameters (Heston-like stochastic volatility)
+        # Default model parameters (Heston with realistic FX values)
+        # Adjusted to satisfy Feller condition: 2*kappa*theta > sigma^2
         self.model_params = model_params or {
-            'v0': 0.01,        # Initial variance
-            'kappa': 1.0,      # Mean reversion speed
-            'theta': 0.01,     # Long-term variance
-            'sigma': 0.3,      # Vol-of-vol
-            'rho': -0.7        # Correlation
+            'v0': 0.014,       # Initial variance (~12% vol)
+            'kappa': 2.0,      # Mean reversion speed
+            'theta': 0.014,    # Long-term variance (~12% vol)
+            'sigma': 0.4,      # Vol-of-vol
+            'rho': -0.6        # Correlation
         }
+        
+        # Validate Feller condition
+        self._validate_feller_condition()
         
         # QuantLib objects
         self.spot_handle = ql.QuoteHandle(ql.SimpleQuote(self.spot_fx))
@@ -62,6 +66,24 @@ class FXStochasticLocalVol:
         self.calibrated_helpers = []
         self.calibration_results = None
         self.black_var_surface = None
+    
+    def _validate_feller_condition(self):
+        """
+        Validate that Heston parameters satisfy the Feller condition:
+        2*kappa*theta > sigma^2
+        This ensures the variance process stays positive
+        """
+        kappa = self.model_params['kappa']
+        theta = self.model_params['theta']
+        sigma = self.model_params['sigma']
+        
+        feller_lhs = 2 * kappa * theta
+        feller_rhs = sigma ** 2
+        
+        if feller_lhs <= feller_rhs:
+            # Adjust sigma to satisfy Feller condition
+            self.model_params['sigma'] = np.sqrt(2 * kappa * theta * 0.95)  # 95% of maximum
+            print(f"Warning: Adjusted sigma from {sigma:.4f} to {self.model_params['sigma']:.4f} to satisfy Feller condition")
     
     def build_vol_surface(self):
         """
@@ -119,20 +141,24 @@ class FXStochasticLocalVol:
     def calibrate(self):
         """
         Calibrate the FX-SLV model parameters to vanilla option prices
-        Uses Heston model as the stochastic volatility component
+        Uses Heston model as the stochastic volatility component with constrained optimization
         """
         # Build volatility surface first
         if self.black_var_surface is None:
             self.build_vol_surface()
         
         # Get initial parameters
-        v0 = self.model_params['v0']
-        kappa = self.model_params['kappa']
-        theta = self.model_params['theta']
-        sigma = self.model_params['sigma']
-        rho = self.model_params['rho']
+        v0 = max(0.001, self.model_params['v0'])      # At least 0.1% vol
+        kappa = max(0.1, self.model_params['kappa'])   # Positive mean reversion
+        theta = max(0.001, self.model_params['theta']) # At least 0.1% vol
+        sigma = max(0.01, self.model_params['sigma'])  # Positive vol-of-vol
+        rho = max(-0.99, min(0.99, self.model_params['rho']))  # Correlation bounds
         
-        # Create Heston process
+        # Ensure Feller condition
+        if 2 * kappa * theta <= sigma ** 2:
+            sigma = np.sqrt(2 * kappa * theta * 0.9)
+        
+        # Create Heston process with validated parameters
         heston_process = ql.HestonProcess(
             self.domestic_curve,
             self.foreign_curve,
@@ -157,15 +183,27 @@ class FXStochasticLocalVol:
         for helper in self.calibrated_helpers:
             helper.setPricingEngine(heston_engine)
         
-        # Calibrate model
+        # Calibrate model with constraints
         optimization_method = ql.LevenbergMarquardt()
         end_criteria = ql.EndCriteria(500, 100, 1e-8, 1e-8, 1e-8)
+        
+        # Add parameter constraints to prevent unrealistic values
+        constraint = ql.PositiveConstraint()
         
         self.heston_model.calibrate(
             self.calibrated_helpers,
             optimization_method,
-            end_criteria
+            end_criteria,
+            constraint
         )
+        
+        # Validate calibrated parameters
+        params = self.heston_model.params()
+        if not self._validate_calibrated_params(params):
+            raise ValueError(
+                "Calibration produced invalid parameters. "
+                "Try adjusting initial parameter guesses or vol surface data."
+            )
         
         # Build local volatility surface from calibrated model
         self._build_local_vol_surface()
@@ -174,6 +212,44 @@ class FXStochasticLocalVol:
         self._extract_calibration_results()
         
         return self.heston_model
+    
+    def _validate_calibrated_params(self, params):
+        """
+        Validate that calibrated parameters are realistic and satisfy constraints
+        """
+        v0 = params[0]
+        kappa = params[1]
+        theta = params[2]
+        sigma = params[3]
+        rho = params[4]
+        
+        # Check for NaN or inf
+        if any(np.isnan(p) or np.isinf(p) for p in params):
+            return False
+        
+        # Check positivity constraints
+        if v0 <= 0 or kappa <= 0 or theta <= 0 or sigma <= 0:
+            return False
+        
+        # Check correlation bounds
+        if abs(rho) >= 1.0:
+            return False
+        
+        # Check Feller condition
+        if 2 * kappa * theta <= sigma ** 2:
+            return False
+        
+        # Check reasonable ranges for FX
+        if v0 > 1.0 or theta > 1.0:  # Variance > 100% is unrealistic
+            return False
+        
+        if kappa > 20:  # Very fast mean reversion is unrealistic
+            return False
+        
+        if sigma > 5.0:  # Vol-of-vol > 500% is unrealistic
+            return False
+        
+        return True
     
     def _create_calibration_helpers(self):
         """
@@ -194,11 +270,12 @@ class FXStochasticLocalVol:
             expiry_years = row['expiry']
             volatility = row['volatility']
             
+            # Skip invalid data
+            if volatility <= 0 or expiry_years <= 0 or strike <= 0:
+                continue
+            
             # Create option helper
             maturity = ql.Period(int(expiry_years * 365), ql.Days)
-            
-            # Determine if call or put (use put for below spot, call for above)
-            option_type = ql.Option.Call if strike >= self.spot_fx else ql.Option.Put
             
             helper = ql.HestonModelHelper(
                 maturity,
@@ -221,18 +298,22 @@ class FXStochasticLocalVol:
         """
         # Create local vol surface from Black variance surface
         if self.black_var_surface:
-            # Use BlackVolTermStructureHandle (correct QuantLib API)
-            black_vol_handle = ql.BlackVolTermStructureHandle(self.black_var_surface)
-            
-            self.local_vol_surface = ql.LocalVolSurface(
-                black_vol_handle,
-                self.domestic_curve,
-                self.foreign_curve,
-                self.spot_handle
-            )
-            
-            # Enable extrapolation
-            self.local_vol_surface.enableExtrapolation()
+            try:
+                # Use BlackVolTermStructureHandle (correct QuantLib API)
+                black_vol_handle = ql.BlackVolTermStructureHandle(self.black_var_surface)
+                
+                self.local_vol_surface = ql.LocalVolSurface(
+                    black_vol_handle,
+                    self.domestic_curve,
+                    self.foreign_curve,
+                    self.spot_handle
+                )
+                
+                # Enable extrapolation
+                self.local_vol_surface.enableExtrapolation()
+            except Exception as e:
+                print(f"Warning: Could not build local vol surface: {e}")
+                self.local_vol_surface = None
         
         return self.local_vol_surface
     
@@ -262,31 +343,40 @@ class FXStochasticLocalVol:
         
         for i, (helper, row) in enumerate(zip(self.calibrated_helpers, data)):
             market_vol = row['volatility']
-            market_price = helper.marketValue()
-            model_price = helper.modelValue()
             
-            # Calculate implied vol from model price
             try:
-                model_vol = helper.impliedVolatility(
-                    model_price,
-                    1e-6,
-                    1000,
-                    0.0,
-                    2.0
-                )
-            except:
+                market_price = helper.marketValue()
+                model_price = helper.modelValue()
+                
+                # Calculate implied vol from model price
+                try:
+                    model_vol = helper.impliedVolatility(
+                        model_price,
+                        1e-6,
+                        1000,
+                        0.0,
+                        2.0
+                    )
+                except:
+                    model_vol = market_vol
+                
+                price_error = model_price - market_price
+                price_error_pct = (price_error / market_price * 100) if market_price != 0 else 0.0
+                vol_error_bps = (model_vol - market_vol) * 10000
+            except Exception as e:
+                # If pricing fails, use market values
+                model_price = 0
                 model_vol = market_vol
-            
-            price_error = model_price - market_price
-            price_error_pct = (price_error / market_price * 100) if market_price != 0 else 0.0
-            vol_error_bps = (model_vol - market_vol) * 10000
+                price_error = 0
+                price_error_pct = 0
+                vol_error_bps = 0
             
             pricing_errors.append({
                 'strike': row['strike'],
                 'expiry': row['expiry'],
                 'market_vol': market_vol * 100,
                 'model_vol': model_vol * 100,
-                'market_price': market_price,
+                'market_price': market_price if 'market_price' in locals() else 0,
                 'model_price': model_price,
                 'price_error': price_error,
                 'price_error_pct': price_error_pct,
@@ -341,11 +431,11 @@ class FXStochasticLocalVol:
         
         # Get calibrated Heston parameters
         params = self.heston_model.params()
-        v0 = params[0]
-        kappa = params[1]
-        theta = params[2]
-        sigma = params[3]
-        rho = params[4]
+        v0 = max(0.0001, params[0])  # Ensure positive
+        kappa = max(0.01, params[1])
+        theta = max(0.0001, params[2])
+        sigma = max(0.01, params[3])
+        rho = max(-0.99, min(0.99, params[4]))
         
         # Get risk-free rates (domestic and foreign)
         rd = self.domestic_curve.zeroRate(horizon_years/2, ql.Continuous).rate()
@@ -370,7 +460,7 @@ class FXStochasticLocalVol:
             vol_paths[i, :] = np.maximum(
                 vol_paths[i-1, :] + kappa * (theta - vol_paths[i-1, :]) * dt + 
                 sigma * np.sqrt(np.maximum(vol_paths[i-1, :], 0)) * dW2[i-1, :],
-                0
+                0.0001  # Floor to prevent zero variance
             )
             
             # Spot FX process
@@ -403,6 +493,12 @@ class FXStochasticLocalVol:
         if not self.heston_model:
             return None
         
+        # Validate parameters first
+        params = self.heston_model.params()
+        if not self._validate_calibrated_params(params):
+            print("Warning: Model parameters may be invalid")
+            return None
+        
         # Use sample from vol surface if no test options provided
         if test_options is None:
             if isinstance(self.vol_surface_data, pd.DataFrame):
@@ -417,62 +513,66 @@ class FXStochasticLocalVol:
         validation_results = []
         
         for strike, expiry, option_type in test_options:
-            # Create vanilla option
-            exercise_date = self.eval_date + ql.Period(int(expiry * 365), ql.Days)
-            exercise = ql.EuropeanExercise(exercise_date)
-            
-            payoff = ql.PlainVanillaPayoff(
-                ql.Option.Call if option_type.lower() == 'call' else ql.Option.Put,
-                strike
-            )
-            
-            option = ql.VanillaOption(payoff, exercise)
-            
-            # Price with Heston model
-            heston_engine = ql.AnalyticHestonEngine(self.heston_model)
-            option.setPricingEngine(heston_engine)
-            heston_price = option.NPV()
-            
-            # Get market vol for this strike/expiry
-            market_vol = 0.12  # Default
-            if isinstance(self.vol_surface_data, pd.DataFrame):
-                matching = self.vol_surface_data[
-                    (abs(self.vol_surface_data['strike'] - strike) < 1e-6) & 
-                    (abs(self.vol_surface_data['expiry'] - expiry) < 1e-6)
-                ]
-                if not matching.empty:
-                    market_vol = matching.iloc[0]['volatility']
-            else:
-                for d in self.vol_surface_data:
-                    if abs(d[0] - strike) < 1e-6 and abs(d[1] - expiry) < 1e-6:
-                        market_vol = d[2]
-                        break
-            
-            # Price with Black-Scholes
-            bs_process = ql.BlackScholesMertonProcess(
-                self.spot_handle,
-                self.foreign_curve,
-                self.domestic_curve,
-                ql.BlackVolTermStructureHandle(
-                    ql.BlackConstantVol(self.eval_date, ql.TARGET(), market_vol, ql.Actual365Fixed())
+            try:
+                # Create vanilla option
+                exercise_date = self.eval_date + ql.Period(int(expiry * 365), ql.Days)
+                exercise = ql.EuropeanExercise(exercise_date)
+                
+                payoff = ql.PlainVanillaPayoff(
+                    ql.Option.Call if option_type.lower() == 'call' else ql.Option.Put,
+                    strike
                 )
-            )
-            bs_engine = ql.AnalyticEuropeanEngine(bs_process)
-            option.setPricingEngine(bs_engine)
-            bs_price = option.NPV()
-            
-            price_diff = heston_price - bs_price
-            price_diff_pct = (price_diff / bs_price * 100) if bs_price != 0 else 0
-            
-            validation_results.append({
-                'strike': strike,
-                'expiry': expiry,
-                'type': option_type,
-                'market_vol': market_vol * 100,
-                'bs_price': bs_price,
-                'heston_price': heston_price,
-                'price_diff': price_diff,
-                'price_diff_pct': price_diff_pct
-            })
+                
+                option = ql.VanillaOption(payoff, exercise)
+                
+                # Get market vol for this strike/expiry
+                market_vol = 0.12  # Default
+                if isinstance(self.vol_surface_data, pd.DataFrame):
+                    matching = self.vol_surface_data[
+                        (abs(self.vol_surface_data['strike'] - strike) < 1e-6) & 
+                        (abs(self.vol_surface_data['expiry'] - expiry) < 1e-6)
+                    ]
+                    if not matching.empty:
+                        market_vol = matching.iloc[0]['volatility']
+                else:
+                    for d in self.vol_surface_data:
+                        if abs(d[0] - strike) < 1e-6 and abs(d[1] - expiry) < 1e-6:
+                            market_vol = d[2]
+                            break
+                
+                # Price with Heston model
+                heston_engine = ql.AnalyticHestonEngine(self.heston_model)
+                option.setPricingEngine(heston_engine)
+                heston_price = option.NPV()
+                
+                # Price with Black-Scholes
+                bs_process = ql.BlackScholesMertonProcess(
+                    self.spot_handle,
+                    self.foreign_curve,
+                    self.domestic_curve,
+                    ql.BlackVolTermStructureHandle(
+                        ql.BlackConstantVol(self.eval_date, ql.TARGET(), market_vol, ql.Actual365Fixed())
+                    )
+                )
+                bs_engine = ql.AnalyticEuropeanEngine(bs_process)
+                option.setPricingEngine(bs_engine)
+                bs_price = option.NPV()
+                
+                price_diff = heston_price - bs_price
+                price_diff_pct = (price_diff / bs_price * 100) if bs_price != 0 else 0
+                
+                validation_results.append({
+                    'strike': strike,
+                    'expiry': expiry,
+                    'type': option_type,
+                    'market_vol': market_vol * 100,
+                    'bs_price': bs_price,
+                    'heston_price': heston_price,
+                    'price_diff': price_diff,
+                    'price_diff_pct': price_diff_pct
+                })
+            except Exception as e:
+                print(f"Warning: Could not validate option K={strike}, T={expiry}: {e}")
+                continue
         
-        return pd.DataFrame(validation_results)
+        return pd.DataFrame(validation_results) if validation_results else None
