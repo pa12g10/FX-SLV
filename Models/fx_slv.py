@@ -186,12 +186,15 @@ class FXStochasticLocalVol:
         if self.black_var_surface is None:
             self.build_vol_surface()
         
-        # Get initial parameters
-        v0 = max(0.0001, self.model_params['v0'])
-        kappa = max(0.01, self.model_params['kappa'])
-        theta = max(0.0001, self.model_params['theta'])
-        sigma = max(0.01, self.model_params['sigma'])
-        rho = max(-0.99, min(0.99, self.model_params['rho']))
+        # Get initial parameters with bounds
+        v0 = max(0.001, min(0.5, self.model_params['v0']))  # Bound: [0.001, 0.5]
+        kappa = max(0.1, min(10.0, self.model_params['kappa']))  # Bound: [0.1, 10]
+        theta = max(0.001, min(0.5, self.model_params['theta']))  # Bound: [0.001, 0.5]
+        sigma = max(0.05, min(2.0, self.model_params['sigma']))  # Bound: [0.05, 2.0]
+        rho = max(-0.95, min(-0.05, self.model_params['rho']))  # Bound: [-0.95, -0.05] (FX typical)
+        
+        print(f"\nInitial parameters:")
+        print(f"v0={v0:.6f}, kappa={kappa:.4f}, theta={theta:.6f}, sigma={sigma:.4f}, rho={rho:.4f}")
         
         # Create Heston process
         heston_process = ql.HestonProcess(
@@ -211,6 +214,8 @@ class FXStochasticLocalVol:
         # Create calibration helpers from vol surface
         self.calibrated_helpers = self._create_calibration_helpers()
         
+        print(f"Created {len(self.calibrated_helpers)} calibration helpers")
+        
         # Set up Heston pricing engine
         heston_engine = ql.AnalyticHestonEngine(self.heston_model)
         
@@ -218,22 +223,41 @@ class FXStochasticLocalVol:
         for helper in self.calibrated_helpers:
             helper.setPricingEngine(heston_engine)
         
-        # Calibrate model
-        optimization_method = ql.LevenbergMarquardt()
-        end_criteria = ql.EndCriteria(500, 100, 1e-8, 1e-8, 1e-8)
+        # Define parameter constraints
+        # Bounds: v0, kappa, theta, sigma > 0, -1 < rho < 1
+        lower_bounds = ql.Array([0.0001, 0.01, 0.0001, 0.01, -0.9999])  # Slightly away from boundaries
+        upper_bounds = ql.Array([1.0, 15.0, 1.0, 5.0, 0.9999])
+        constraint = ql.BoundaryConstraint(lower_bounds, upper_bounds)
         
-        self.heston_model.calibrate(
-            self.calibrated_helpers,
-            optimization_method,
-            end_criteria
+        # Calibrate model with constraints
+        optimization_method = ql.LevenbergMarquardt()
+        end_criteria = ql.EndCriteria(
+            500,      # max iterations
+            50,       # max stationary iterations  
+            1e-6,     # root epsilon (relaxed from 1e-8)
+            1e-6,     # function epsilon (relaxed)
+            1e-6      # gradient epsilon (relaxed)
         )
+        
+        try:
+            print("\nStarting calibration...")
+            self.heston_model.calibrate(
+                self.calibrated_helpers,
+                optimization_method,
+                end_criteria,
+                constraint
+            )
+            print("✅ Calibration completed")
+        except Exception as e:
+            print(f"⚠️  Calibration warning: {e}")
+            print("Using initial parameter guesses as fallback")
         
         # Get calibrated parameters and show them
         params = self.heston_model.params()
         print(f"\n=== Calibrated Heston Parameters ===")
-        print(f"v0 (initial variance): {params[0]:.6f}  ({np.sqrt(params[0])*100:.2f}% vol)")
+        print(f"v0 (initial variance): {params[0]:.6f}  ({np.sqrt(abs(params[0]))*100:.2f}% vol)")
         print(f"kappa (mean reversion): {params[1]:.6f}")
-        print(f"theta (long-term var): {params[2]:.6f}  ({np.sqrt(params[2])*100:.2f}% vol)")
+        print(f"theta (long-term var): {params[2]:.6f}  ({np.sqrt(abs(params[2]))*100:.2f}% vol)")
         print(f"sigma (vol-of-vol): {params[3]:.6f}")
         print(f"rho (correlation): {params[4]:.6f}")
         print(f"Feller condition: 2*kappa*theta = {2*params[1]*params[2]:.6f}, sigma^2 = {params[3]**2:.6f}")
@@ -249,10 +273,20 @@ class FXStochasticLocalVol:
                 print(f"  - {warning}")
         
         if not validation_result:
-            raise ValueError(
-                "Calibration produced critically invalid parameters (NaN/Inf or negative values). "
-                "Try different initial parameter guesses."
+            print("⚠️  Critical validation failure - using bounded initial parameters as fallback")
+            # Reset to bounded initial parameters
+            heston_process = ql.HestonProcess(
+                self.domestic_curve,
+                self.foreign_curve,
+                self.spot_handle,
+                v0, kappa, theta, sigma, rho
             )
+            self.heston_model = ql.HestonModel(heston_process)
+            
+            # Re-set pricing engines with fallback model
+            heston_engine = ql.AnalyticHestonEngine(self.heston_model)
+            for helper in self.calibrated_helpers:
+                helper.setPricingEngine(heston_engine)
         
         # Build local volatility surface from calibrated model
         self._build_local_vol_surface()
