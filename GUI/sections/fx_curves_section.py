@@ -1,4 +1,4 @@
-# FX Curves Section
+# FX Curves Section - Market Data Display & Curve Bootstrapping
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -8,7 +8,18 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from Models.fx_curves import FXCurves
+from MarketData import (
+    get_eval_date,
+    get_sofr_deposit_data,
+    get_sofr_futures_data,
+    get_sofr_swaps_data,
+    get_estr_deposit_data,
+    get_estr_futures_data,
+    get_estr_swaps_data,
+    get_fx_spot,
+    get_fx_forwards_data,
+    get_ccy_swaps_data
+)
 
 try:
     import QuantLib as ql
@@ -17,338 +28,352 @@ except ImportError:
 
 def render_fx_curves_section():
     """
-    Render the FX Curves calibration section
+    Render the FX Curves section with market data display and curve bootstrapping
     """
-    st.header("FX Yield Curves & Spot Rate")
+    st.header("🌍 FX Curves & Market Data")
     
     if ql is None:
         st.error("QuantLib is not installed. Please install it to use FX-SLV features.")
         return
     
+    # Get evaluation date
+    eval_date = get_eval_date()
+    st.info(f"**Evaluation Date:** {eval_date.dayOfMonth()}/{eval_date.month()}/{eval_date.year()}")
+    
     st.markdown("---")
     
-    # Market Data Input
-    st.subheader("Market Data Configuration")
+    # ========================
+    # SECTION 1: FX Spot
+    # ========================
+    st.subheader("💱 FX Spot Rate")
     
-    col1, col2, col3 = st.columns(3)
+    fx_spot_data = get_fx_spot()
     
+    col1, col2 = st.columns([1, 2])
     with col1:
-        spot_fx = st.number_input(
-            "Spot FX Rate (USD/EUR)",
-            value=1.10,
-            format="%.4f",
-            help="Current spot exchange rate",
-            key="fx_spot"
+        st.metric(
+            label=f"**{fx_spot_data['pair']}**",
+            value=f"{fx_spot_data['rate']:.4f}",
+            delta=None
         )
-    
     with col2:
-        domestic_currency = st.text_input(
-            "Domestic Currency",
-            value="USD",
-            key="fx_dom_ccy"
-        )
+        st.info("Spot rate used for FX forward pricing and cross-currency swap valuation")
     
+    st.markdown("---")
+    
+    # ========================
+    # SECTION 2: USD SOFR Curve Instruments
+    # ========================
+    st.subheader("🇺🇸 USD SOFR Curve Instruments")
+    
+    # Create tabs for different instrument types
+    sofr_tab1, sofr_tab2, sofr_tab3 = st.tabs(["📅 Deposits", "📊 Futures", "💼 OIS Swaps"])
+    
+    with sofr_tab1:
+        st.write("**SOFR Overnight Deposit**")
+        deposit_data = get_sofr_deposit_data()
+        
+        deposit_df = pd.DataFrame([deposit_data])
+        st.dataframe(deposit_df, use_container_width=True, hide_index=True)
+    
+    with sofr_tab2:
+        st.write("**SOFR Futures (1M - 18M)**")
+        futures_data = get_sofr_futures_data()
+        
+        st.dataframe(futures_data, use_container_width=True, hide_index=True)
+        
+        # Plot futures rates
+        fig_sofr_fut = go.Figure()
+        fig_sofr_fut.add_trace(go.Scatter(
+            x=futures_data.index,
+            y=futures_data['rate'],
+            mode='lines+markers',
+            name='SOFR Futures Rate',
+            line=dict(width=3, color='blue'),
+            marker=dict(size=8)
+        ))
+        fig_sofr_fut.update_layout(
+            title="SOFR Futures Implied Rates",
+            xaxis_title="Contract",
+            yaxis_title="Rate (%)",
+            height=400
+        )
+        st.plotly_chart(fig_sofr_fut, use_container_width=True)
+    
+    with sofr_tab3:
+        st.write("**SOFR OIS Swaps (2Y - 30Y)**")
+        swaps_data = get_sofr_swaps_data()
+        
+        st.dataframe(swaps_data, use_container_width=True, hide_index=True)
+        
+        # Plot swap rates
+        fig_sofr_swap = go.Figure()
+        fig_sofr_swap.add_trace(go.Scatter(
+            x=swaps_data.index,
+            y=swaps_data['rate'],
+            mode='lines+markers',
+            name='SOFR OIS Rate',
+            line=dict(width=3, color='darkblue'),
+            marker=dict(size=8)
+        ))
+        fig_sofr_swap.update_layout(
+            title="SOFR OIS Swap Rates",
+            xaxis_title="Tenor",
+            yaxis_title="Rate (%)",
+            height=400
+        )
+        st.plotly_chart(fig_sofr_swap, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # ========================
+    # SECTION 3: EUR ESTR Curve Instruments
+    # ========================
+    st.subheader("🇪🇺 EUR ESTR Curve Instruments")
+    
+    # Create tabs for different instrument types
+    estr_tab1, estr_tab2, estr_tab3 = st.tabs(["📅 Deposits", "📊 Futures", "💼 OIS Swaps"])
+    
+    with estr_tab1:
+        st.write("**ESTR Overnight Deposit**")
+        deposit_data = get_estr_deposit_data()
+        
+        deposit_df = pd.DataFrame([deposit_data])
+        st.dataframe(deposit_df, use_container_width=True, hide_index=True)
+    
+    with estr_tab2:
+        st.write("**ESTR Futures (1M - 18M)**")
+        futures_data = get_estr_futures_data()
+        
+        st.dataframe(futures_data, use_container_width=True, hide_index=True)
+        
+        # Plot futures rates
+        fig_estr_fut = go.Figure()
+        fig_estr_fut.add_trace(go.Scatter(
+            x=futures_data.index,
+            y=futures_data['rate'],
+            mode='lines+markers',
+            name='ESTR Futures Rate',
+            line=dict(width=3, color='red'),
+            marker=dict(size=8)
+        ))
+        fig_estr_fut.update_layout(
+            title="ESTR Futures Implied Rates",
+            xaxis_title="Contract",
+            yaxis_title="Rate (%)",
+            height=400
+        )
+        st.plotly_chart(fig_estr_fut, use_container_width=True)
+    
+    with estr_tab3:
+        st.write("**ESTR OIS Swaps (2Y - 30Y)**"")
+        swaps_data = get_estr_swaps_data()
+        
+        st.dataframe(swaps_data, use_container_width=True, hide_index=True)
+        
+        # Plot swap rates
+        fig_estr_swap = go.Figure()
+        fig_estr_swap.add_trace(go.Scatter(
+            x=swaps_data.index,
+            y=swaps_data['rate'],
+            mode='lines+markers',
+            name='ESTR OIS Rate',
+            line=dict(width=3, color='darkred'),
+            marker=dict(size=8)
+        ))
+        fig_estr_swap.update_layout(
+            title="ESTR OIS Swap Rates",
+            xaxis_title="Tenor",
+            yaxis_title="Rate (%)",
+            height=400
+        )
+        st.plotly_chart(fig_estr_swap, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # ========================
+    # SECTION 4: FX Forwards
+    # ========================
+    st.subheader("📈 FX Forward Rates (EUR/USD)")
+    
+    fx_forwards_data = get_fx_forwards_data()
+    st.dataframe(fx_forwards_data, use_container_width=True, hide_index=True)
+    
+    # Plot forward points
+    fig_fwd = go.Figure()
+    
+    fig_fwd.add_trace(go.Scatter(
+        x=fx_forwards_data.index,
+        y=fx_forwards_data['points'],
+        mode='lines+markers',
+        name='Forward Points',
+        line=dict(width=3, color='green'),
+        marker=dict(size=8),
+        yaxis='y1'
+    ))
+    
+    fig_fwd.add_trace(go.Scatter(
+        x=fx_forwards_data.index,
+        y=fx_forwards_data['outright'],
+        mode='lines+markers',
+        name='Outright Rate',
+        line=dict(width=3, color='purple', dash='dash'),
+        marker=dict(size=8),
+        yaxis='y2'
+    ))
+    
+    fig_fwd.update_layout(
+        title="EUR/USD Forward Points and Outright Rates",
+        xaxis_title="Tenor",
+        yaxis_title="Forward Points (pips)",
+        yaxis2=dict(
+            title="Outright Rate",
+            overlaying='y',
+            side='right'
+        ),
+        height=500,
+        hovermode='x unified'
+    )
+    
+    st.plotly_chart(fig_fwd, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # ========================
+    # SECTION 5: Cross-Currency Basis Swaps
+    # ========================
+    st.subheader("🔄 Cross-Currency Basis Swaps (EUR/USD)")
+    
+    ccy_swaps_data = get_ccy_swaps_data()
+    st.dataframe(ccy_swaps_data, use_container_width=True, hide_index=True)
+    
+    # Plot basis spreads
+    fig_basis = go.Figure()
+    
+    fig_basis.add_trace(go.Scatter(
+        x=ccy_swaps_data.index,
+        y=ccy_swaps_data['basis'],
+        mode='lines+markers',
+        name='CCY Basis Spread',
+        line=dict(width=3, color='orange'),
+        marker=dict(size=10)
+    ))
+    
+    fig_basis.add_hline(
+        y=0,
+        line_dash="dash",
+        line_color="gray",
+        annotation_text="Zero Basis"
+    )
+    
+    fig_basis.update_layout(
+        title="EUR/USD Cross-Currency Basis Spreads",
+        xaxis_title="Tenor",
+        yaxis_title="Basis Spread (bps)",
+        height=500
+    )
+    
+    st.plotly_chart(fig_basis, use_container_width=True)
+    
+    st.info("""
+    **Cross-Currency Basis Interpretation:**
+    - Negative basis: EUR funding is cheaper than USD funding (adjusted)
+    - The basis compensates for supply/demand imbalances in FX swap market
+    - EUR/USD basis has been persistently negative since 2008 financial crisis
+    """)
+    
+    st.markdown("---")
+    
+    # ========================
+    # SECTION 6: Curve Comparison
+    # ========================
+    st.subheader("📊 SOFR vs ESTR Comparison")
+    
+    sofr_swaps = get_sofr_swaps_data()
+    estr_swaps = get_estr_swaps_data()
+    
+    # Combine for comparison
+    comparison_fig = go.Figure()
+    
+    comparison_fig.add_trace(go.Scatter(
+        x=sofr_swaps.index,
+        y=sofr_swaps['rate'],
+        mode='lines+markers',
+        name='USD SOFR',
+        line=dict(width=3, color='blue'),
+        marker=dict(size=8)
+    ))
+    
+    comparison_fig.add_trace(go.Scatter(
+        x=estr_swaps.index,
+        y=estr_swaps['rate'],
+        mode='lines+markers',
+        name='EUR ESTR',
+        line=dict(width=3, color='red'),
+        marker=dict(size=8)
+    ))
+    
+    # Calculate spread
+    spread = sofr_swaps['rate'] - estr_swaps['rate']
+    
+    comparison_fig.add_trace(go.Scatter(
+        x=sofr_swaps.index,
+        y=spread,
+        mode='lines',
+        name='Spread (SOFR - ESTR)',
+        line=dict(width=2, color='green', dash='dot'),
+        yaxis='y2'
+    ))
+    
+    comparison_fig.update_layout(
+        title="USD SOFR vs EUR ESTR - OIS Swap Rates",
+        xaxis_title="Tenor",
+        yaxis_title="Rate (%)",
+        yaxis2=dict(
+            title="Spread (bps)",
+            overlaying='y',
+            side='right'
+        ),
+        height=600,
+        hovermode='x unified'
+    )
+    
+    st.plotly_chart(comparison_fig, use_container_width=True)
+    
+    # Statistics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        sofr_5y = sofr_swaps[sofr_swaps['tenor'] == '5Y']['rate'].values[0]
+        st.metric("SOFR 5Y", f"{sofr_5y:.2f}%")
+    with col2:
+        estr_5y = estr_swaps[estr_swaps['tenor'] == '5Y']['rate'].values[0]
+        st.metric("ESTR 5Y", f"{estr_5y:.2f}%")
     with col3:
-        foreign_currency = st.text_input(
-            "Foreign Currency",
-            value="EUR",
-            key="fx_for_ccy"
-        )
-    
-    st.write("")
-    
-    # Yield Curves Input
-    st.subheader("Yield Curve Data")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.write(f"**{domestic_currency} (Domestic) Rates**")
-        
-        # Default domestic rates (USD)
-        default_domestic = pd.DataFrame({
-            'Tenor (Years)': [0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30],
-            'Rate (%)': [4.50, 4.60, 4.70, 4.50, 4.30, 4.00, 3.90, 3.80, 3.70, 3.65, 3.60]
-        })
-        
-        domestic_rates_df = st.data_editor(
-            default_domestic,
-            num_rows="dynamic",
-            key="fx_domestic_rates",
-            hide_index=True
-        )
-    
-    with col2:
-        st.write(f"**{foreign_currency} (Foreign) Rates**")
-        
-        # Default foreign rates (EUR)
-        default_foreign = pd.DataFrame({
-            'Tenor (Years)': [0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30],
-            'Rate (%)': [3.00, 3.10, 3.20, 3.00, 2.90, 2.70, 2.65, 2.60, 2.55, 2.50, 2.45]
-        })
-        
-        foreign_rates_df = st.data_editor(
-            default_foreign,
-            num_rows="dynamic",
-            key="fx_foreign_rates",
-            hide_index=True
-        )
+        spread_5y = sofr_5y - estr_5y
+        st.metric("5Y Spread", f"{spread_5y:.2f}%", f"{spread_5y*100:.0f} bps")
+    with col4:
+        fx_fwd_5y = fx_forwards_data[fx_forwards_data['tenor'] == '5Y']['points'].values[0]
+        st.metric("FX 5Y Fwd Pts", f"{fx_fwd_5y:.1f} pips")
     
     st.markdown("---")
     
-    # Calibration Section
-    st.subheader("Curve Calibration")
+    # ========================
+    # SECTION 7: Bootstrap Curves (Placeholder)
+    # ========================
+    st.subheader("⚙️ Curve Bootstrapping")
     
-    # Store FX curves in session state
-    if 'fx_curves' not in st.session_state:
-        st.session_state.fx_curves = None
+    st.info("""
+    **Next Step: Curve Construction**
     
-    if st.button("Bootstrap FX Curves", type="primary", key="fx_curves_calibrate_btn"):
-        with st.spinner("Bootstrapping yield curves..."):
-            try:
-                # Set evaluation date
-                eval_date = ql.Date(8, 3, 2026)
-                ql.Settings.instance().evaluationDate = eval_date
-                
-                # Prepare rate data
-                domestic_rates = [[row['Tenor (Years)'], row['Rate (%)']/100] 
-                                for _, row in domestic_rates_df.iterrows()]
-                foreign_rates = [[row['Tenor (Years)'], row['Rate (%)']/100] 
-                               for _, row in foreign_rates_df.iterrows()]
-                
-                # Create FX curves object
-                fx_curves = FXCurves(
-                    eval_date,
-                    domestic_rates,
-                    foreign_rates,
-                    domestic_currency,
-                    foreign_currency
-                )
-                
-                # Bootstrap curves
-                fx_curves.bootstrap_curves()
-                
-                # Store in session state
-                st.session_state.fx_curves = fx_curves
-                st.session_state.spot_fx = spot_fx
-                
-                st.success(f"✅ FX curves bootstrapped successfully for {domestic_currency}/{foreign_currency}!")
-                
-            except Exception as e:
-                st.error(f"Curve bootstrapping failed: {str(e)}")
+    The market data above will be used to bootstrap:
+    1. **USD SOFR Curve** - Using deposits, futures, and OIS swaps
+    2. **EUR ESTR Curve** - Using deposits, futures, and OIS swaps  
+    3. **FX Forward Curve** - From covered interest parity with FX forwards
+    4. **CCY Basis Curve** - Incorporating cross-currency basis spreads
     
-    st.markdown("---")
+    Click the button below to proceed with curve construction.
+    """)
     
-    # Results Section
-    if st.session_state.fx_curves is not None:
-        st.subheader("FX Curves Results")
-        
-        fx_curves = st.session_state.fx_curves
-        spot = st.session_state.spot_fx
-        
-        # Create tabs for different views
-        tab1, tab2, tab3 = st.tabs([
-            "📊 Zero Rates",
-            "💰 Discount Factors",
-            "📈 Forward FX Rates"
-        ])
-        
-        with tab1:
-            st.write("**Zero Rate Curves**")
-            
-            # Generate points for plotting
-            tenors = np.linspace(0.1, 30, 100)
-            domestic_zeros = []
-            foreign_zeros = []
-            
-            for t in tenors:
-                try:
-                    dom_rate = fx_curves.domestic_curve.zeroRate(t, ql.Continuous).rate() * 100
-                    for_rate = fx_curves.foreign_curve.zeroRate(t, ql.Continuous).rate() * 100
-                    domestic_zeros.append(dom_rate)
-                    foreign_zeros.append(for_rate)
-                except:
-                    domestic_zeros.append(None)
-                    foreign_zeros.append(None)
-            
-            # Plot zero curves
-            fig_zero = go.Figure()
-            
-            fig_zero.add_trace(go.Scatter(
-                x=tenors,
-                y=domestic_zeros,
-                mode='lines',
-                name=f'{fx_curves.domestic_currency} (Domestic)',
-                line=dict(width=3, color='blue')
-            ))
-            
-            fig_zero.add_trace(go.Scatter(
-                x=tenors,
-                y=foreign_zeros,
-                mode='lines',
-                name=f'{fx_curves.foreign_currency} (Foreign)',
-                line=dict(width=3, color='red')
-            ))
-            
-            # Add market input points
-            fig_zero.add_trace(go.Scatter(
-                x=domestic_rates_df['Tenor (Years)'],
-                y=domestic_rates_df['Rate (%)'],
-                mode='markers',
-                name=f'{fx_curves.domestic_currency} Market Points',
-                marker=dict(size=10, color='blue', symbol='diamond')
-            ))
-            
-            fig_zero.add_trace(go.Scatter(
-                x=foreign_rates_df['Tenor (Years)'],
-                y=foreign_rates_df['Rate (%)'],
-                mode='markers',
-                name=f'{fx_curves.foreign_currency} Market Points',
-                marker=dict(size=10, color='red', symbol='diamond')
-            ))
-            
-            fig_zero.update_layout(
-                title="Zero Rate Curves",
-                xaxis_title="Tenor (Years)",
-                yaxis_title="Zero Rate (%)",
-                height=600,
-                hovermode='x unified'
-            )
-            
-            st.plotly_chart(fig_zero, use_container_width=True, key="fx_zero_chart")
-            
-            # Statistics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                dom_1y = fx_curves.domestic_curve.zeroRate(1.0, ql.Continuous).rate() * 100
-                st.metric(f"{fx_curves.domestic_currency} 1Y Rate", f"{dom_1y:.4f}%")
-            with col2:
-                for_1y = fx_curves.foreign_curve.zeroRate(1.0, ql.Continuous).rate() * 100
-                st.metric(f"{fx_curves.foreign_currency} 1Y Rate", f"{for_1y:.4f}%")
-            with col3:
-                rate_diff = dom_1y - for_1y
-                st.metric("Rate Differential (1Y)", f"{rate_diff:.4f}%")
-        
-        with tab2:
-            st.write("**Discount Factor Curves**")
-            
-            # Generate discount factors
-            tenors = np.linspace(0.1, 30, 100)
-            domestic_dfs, foreign_dfs = fx_curves.get_discount_factors(tenors)
-            
-            # Plot discount factors
-            fig_df = go.Figure()
-            
-            fig_df.add_trace(go.Scatter(
-                x=tenors,
-                y=domestic_dfs,
-                mode='lines',
-                name=f'{fx_curves.domestic_currency} (Domestic)',
-                line=dict(width=3, color='blue')
-            ))
-            
-            fig_df.add_trace(go.Scatter(
-                x=tenors,
-                y=foreign_dfs,
-                mode='lines',
-                name=f'{fx_curves.foreign_currency} (Foreign)',
-                line=dict(width=3, color='red')
-            ))
-            
-            fig_df.update_layout(
-                title="Discount Factor Curves",
-                xaxis_title="Tenor (Years)",
-                yaxis_title="Discount Factor",
-                height=600,
-                hovermode='x unified'
-            )
-            
-            st.plotly_chart(fig_df, use_container_width=True, key="fx_df_chart")
-            
-            # Statistics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                dom_df_10y = fx_curves.domestic_curve.discount(10.0)
-                st.metric(f"{fx_curves.domestic_currency} 10Y DF", f"{dom_df_10y:.6f}")
-            with col2:
-                for_df_10y = fx_curves.foreign_curve.discount(10.0)
-                st.metric(f"{fx_curves.foreign_currency} 10Y DF", f"{for_df_10y:.6f}")
-            with col3:
-                df_ratio = for_df_10y / dom_df_10y
-                st.metric("DF Ratio (For/Dom)", f"{df_ratio:.6f}")
-        
-        with tab3:
-            st.write("**Forward FX Rates**")
-            st.info("Forward FX rate calculated using covered interest rate parity: F = S × (DF_foreign / DF_domestic)")
-            
-            # Generate forward FX rates
-            tenors = np.linspace(0.1, 10, 50)
-            forward_fx_rates = [fx_curves.get_forward_fx(spot, t) for t in tenors]
-            
-            # Plot forward FX curve
-            fig_fwd = go.Figure()
-            
-            fig_fwd.add_trace(go.Scatter(
-                x=tenors,
-                y=forward_fx_rates,
-                mode='lines',
-                name='Forward FX Rate',
-                line=dict(width=3, color='green')
-            ))
-            
-            # Add spot rate line
-            fig_fwd.add_hline(
-                y=spot,
-                line_dash="dash",
-                line_color="blue",
-                line_width=2,
-                annotation_text=f"Spot: {spot:.4f}",
-                annotation_position="right"
-            )
-            
-            fig_fwd.update_layout(
-                title=f"Forward FX Curve ({fx_curves.domestic_currency}/{fx_curves.foreign_currency})",
-                xaxis_title="Tenor (Years)",
-                yaxis_title=f"FX Rate ({fx_curves.domestic_currency}/{fx_curves.foreign_currency})",
-                height=600,
-                hovermode='x unified'
-            )
-            
-            st.plotly_chart(fig_fwd, use_container_width=True, key="fx_fwd_chart")
-            
-            # Forward points calculation
-            st.write("**Forward Points Analysis**")
-            
-            sample_tenors = [0.25, 0.5, 1, 2, 3, 5, 10]
-            forward_data = []
-            
-            for tenor in sample_tenors:
-                if tenor <= 10:
-                    fwd_rate = fx_curves.get_forward_fx(spot, tenor)
-                    fwd_points = (fwd_rate - spot) * 10000  # in pips
-                    forward_data.append({
-                        'Tenor': f"{tenor}Y",
-                        'Spot': spot,
-                        'Forward': fwd_rate,
-                        'Forward Points (pips)': fwd_points
-                    })
-            
-            forward_df = pd.DataFrame(forward_data)
-            st.dataframe(forward_df, use_container_width=True, hide_index=True)
-            
-            # Statistics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                fwd_1y = fx_curves.get_forward_fx(spot, 1.0)
-                st.metric("1Y Forward", f"{fwd_1y:.4f}")
-            with col2:
-                fwd_5y = fx_curves.get_forward_fx(spot, 5.0)
-                st.metric("5Y Forward", f"{fwd_5y:.4f}")
-            with col3:
-                premium = ((fwd_1y - spot) / spot) * 100
-                st.metric("1Y Forward Premium", f"{premium:.4f}%")
-    
-    else:
-        st.info("Click 'Bootstrap FX Curves' to see results")
-    
-    st.markdown("---")
+    if st.button("🚀 Bootstrap All Curves", type="primary", use_container_width=True):
+        st.warning("Curve bootstrapping functionality will be implemented in the next section.")
+        st.info("This will use the Pricing modules (DepositPricer, FuturesPricer, SwapPricer, etc.) to build yield curves.")
