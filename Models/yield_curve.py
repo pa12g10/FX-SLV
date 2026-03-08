@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import sys
 import os
+from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -30,6 +31,7 @@ class YieldCurveBuilder:
         self.currency = currency
         self.curve = None
         self.helpers = []
+        self.selected_instruments = []
         
         # Set QuantLib evaluation date
         ql.Settings.instance().evaluationDate = eval_date
@@ -38,6 +40,121 @@ class YieldCurveBuilder:
         self.deposit_pricer = DepositPricer(eval_date)
         self.futures_pricer = FuturesPricer(eval_date)
         self.swap_pricer = SwapPricer(eval_date)
+    
+    def _parse_tenor_to_period(self, tenor_str):
+        """
+        Parse tenor string to QuantLib Period
+        """
+        tenor_str = tenor_str.upper().strip()
+        
+        if tenor_str == 'ON':
+            return ql.Period(1, ql.Days)
+        elif tenor_str.endswith('D'):
+            days = int(tenor_str[:-1])
+            return ql.Period(days, ql.Days)
+        elif tenor_str.endswith('W'):
+            weeks = int(tenor_str[:-1])
+            return ql.Period(weeks, ql.Weeks)
+        elif tenor_str.endswith('M'):
+            months = int(tenor_str[:-1])
+            return ql.Period(months, ql.Months)
+        elif tenor_str.endswith('Y'):
+            years = int(tenor_str[:-1])
+            return ql.Period(years, ql.Years)
+        else:
+            raise ValueError(f"Invalid tenor format: {tenor_str}")
+    
+    def _calculate_pillar_date(self, tenor_or_date):
+        """
+        Calculate the pillar date for an instrument
+        """
+        if isinstance(tenor_or_date, ql.Date):
+            return tenor_or_date
+        elif isinstance(tenor_or_date, str):
+            period = self._parse_tenor_to_period(tenor_or_date)
+            # Add 2 settlement days (standard)
+            return self.eval_date + ql.Period(2, ql.Days) + period
+        elif isinstance(tenor_or_date, ql.Period):
+            return self.eval_date + ql.Period(2, ql.Days) + tenor_or_date
+        else:
+            raise ValueError(f"Cannot calculate pillar date from {type(tenor_or_date)}")
+    
+    def _select_instruments(self, deposit_data, futures_data, swaps_data):
+        """
+        Select non-overlapping instruments for curve bootstrapping
+        Priority: deposits (short) -> futures (short-med) -> swaps (med-long)
+        """
+        selected = []
+        used_dates = set()
+        
+        # 1. Add deposit (always ON)
+        deposit_date = self._calculate_pillar_date('ON')
+        selected.append({
+            'type': 'deposit',
+            'pillar_date': deposit_date,
+            'data': deposit_data,
+            'tenor': 'ON'
+        })
+        used_dates.add(deposit_date)
+        
+        print(f"\nSelecting instruments for {self.currency} curve:")
+        print(f"  Deposit ON: {deposit_date}")
+        
+        # 2. Add futures (check for conflicts)
+        print(f"\n  Futures:")
+        for idx, row in futures_data.iterrows():
+            maturity_date = self._calculate_pillar_date(row['maturity'])
+            
+            # Check if date already used
+            if maturity_date in used_dates:
+                print(f"    {row['maturity']}: SKIP (pillar {maturity_date} already used)")
+                continue
+            
+            # Check if too close to any swap (within 5 days)
+            too_close = False
+            for _, swap_row in swaps_data.iterrows():
+                swap_date = self._calculate_pillar_date(swap_row['tenor'])
+                days_diff = abs((swap_date - maturity_date))
+                if days_diff <= 5:
+                    print(f"    {row['maturity']}: SKIP (too close to swap {swap_row['tenor']})")
+                    too_close = True
+                    break
+            
+            if too_close:
+                continue
+            
+            selected.append({
+                'type': 'futures',
+                'pillar_date': maturity_date,
+                'data': row,
+                'tenor': row['maturity']
+            })
+            used_dates.add(maturity_date)
+            print(f"    {row['maturity']}: ADD (pillar {maturity_date})")
+        
+        # 3. Add swaps (these take priority in case of conflicts)
+        print(f"\n  Swaps:")
+        for idx, row in swaps_data.iterrows():
+            maturity_date = self._calculate_pillar_date(row['tenor'])
+            
+            if maturity_date in used_dates:
+                print(f"    {row['tenor']}: SKIP (pillar {maturity_date} already used)")
+                continue
+            
+            selected.append({
+                'type': 'swap',
+                'pillar_date': maturity_date,
+                'data': row,
+                'tenor': row['tenor']
+            })
+            used_dates.add(maturity_date)
+            print(f"    {row['tenor']}: ADD (pillar {maturity_date})")
+        
+        # Sort by pillar date
+        selected.sort(key=lambda x: x['pillar_date'])
+        
+        self.selected_instruments = selected
+        return selected
     
     def bootstrap_curve(self, deposit_data, futures_data, swaps_data):
         """
@@ -56,45 +173,14 @@ class YieldCurveBuilder:
         --------
         QuantLib.YieldTermStructure: Bootstrapped curve
         """
-        self.helpers = []
+        print(f"\n{'='*60}")
+        print(f"Bootstrapping {self.currency} Curve")
+        print(f"{'='*60}")
         
-        # 1. Add Deposit Helper (Overnight)
-        print(f"\n=== Bootstrapping {self.currency} Curve ===")
-        print(f"Adding deposit: ON @ {deposit_data['rate']:.2f}%")
+        # Select non-overlapping instruments
+        selected = self._select_instruments(deposit_data, futures_data, swaps_data)
         
-        deposit_helper = self.deposit_pricer.create_helper(
-            rate=deposit_data['rate'],
-            day_count=deposit_data['day_count']
-        )
-        self.helpers.append(deposit_helper)
-        
-        # 2. Add Futures Helpers (only up to 1Y to avoid overlap with 2Y swap)
-        print(f"\nAdding futures contracts (filtering to avoid overlap):")
-        futures_added = 0
-        for idx, row in futures_data.iterrows():
-            # Only add futures up to 1Y maturity
-            # This avoids overlap with 2Y swaps
-            if self._parse_tenor_to_years(row['maturity']) <= 1.0:
-                print(f"  {row['maturity']}: {row['price']:.2f} (implied: {row['rate']:.2f}%)")
-                
-                futures_helper = self.futures_pricer.create_helper(
-                    maturity=row['maturity'],
-                    price=row['price'],
-                    day_count=row['day_count']
-                )
-                self.helpers.append(futures_helper)
-                futures_added += 1
-            else:
-                print(f"  {row['maturity']}: SKIPPED (would overlap with swaps)")
-        
-        print(f"Added {futures_added} futures contracts")
-        
-        # 3. Add Swap Helpers
-        # For swaps, we need a preliminary curve handle for the swap pricer
-        # Create a flat forward curve as initial guess
-        print(f"\nAdding {len(swaps_data)} OIS swaps:")
-        
-        # Use first swap rate as initial flat rate
+        # Create flat forward curve for swap helpers
         initial_rate = swaps_data.iloc[0]['rate'] / 100.0
         flat_forward = ql.FlatForward(
             self.eval_date,
@@ -104,21 +190,45 @@ class YieldCurveBuilder:
         )
         curve_handle = ql.YieldTermStructureHandle(flat_forward)
         
-        for idx, row in swaps_data.iterrows():
-            print(f"  {row['tenor']}: {row['rate']:.2f}%")
-            
-            swap_helper = self.swap_pricer.create_helper(
-                tenor=row['tenor'],
-                rate=row['rate'],
-                curve_handle=curve_handle,
-                fixed_freq=row['fixed_freq'],
-                float_freq=row['float_freq'],
-                day_count=row['day_count']
-            )
-            self.helpers.append(swap_helper)
+        # Create helpers
+        self.helpers = []
+        print(f"\nCreating rate helpers:")
         
-        # 4. Bootstrap the curve using PiecewiseLogLinear
-        print(f"\nBootstrapping curve with {len(self.helpers)} instruments...")
+        for instrument in selected:
+            if instrument['type'] == 'deposit':
+                data = instrument['data']
+                helper = self.deposit_pricer.create_helper(
+                    rate=data['rate'],
+                    day_count=data['day_count']
+                )
+                self.helpers.append(helper)
+                print(f"  {instrument['tenor']}: Deposit @ {data['rate']:.2f}%")
+            
+            elif instrument['type'] == 'futures':
+                data = instrument['data']
+                helper = self.futures_pricer.create_helper(
+                    maturity=data['maturity'],
+                    price=data['price'],
+                    day_count=data['day_count']
+                )
+                self.helpers.append(helper)
+                print(f"  {instrument['tenor']}: Futures @ {data['price']:.2f} ({data['rate']:.2f}%)")
+            
+            elif instrument['type'] == 'swap':
+                data = instrument['data']
+                helper = self.swap_pricer.create_helper(
+                    tenor=data['tenor'],
+                    rate=data['rate'],
+                    curve_handle=curve_handle,
+                    fixed_freq=data['fixed_freq'],
+                    float_freq=data['float_freq'],
+                    day_count=data['day_count']
+                )
+                self.helpers.append(helper)
+                print(f"  {instrument['tenor']}: Swap @ {data['rate']:.2f}%")
+        
+        # Bootstrap the curve
+        print(f"\nBootstrapping with {len(self.helpers)} instruments...")
         
         try:
             self.curve = ql.PiecewiseLogLinearDiscount(
@@ -130,39 +240,27 @@ class YieldCurveBuilder:
             # Enable extrapolation
             self.curve.enableExtrapolation()
             
-            print(f"✅ {self.currency} curve bootstrapped successfully!")
-            print(f"   Number of nodes: {len(self.helpers)}")
+            print(f"\n✅ {self.currency} curve bootstrapped successfully!")
+            print(f"   Instruments used: {len(self.helpers)}")
             print(f"   Max maturity: {self._get_max_maturity():.1f} years")
             
-            # Print some sample rates
+            # Print sample rates
             print(f"\nSample Zero Rates:")
-            for tenor in [1, 2, 5, 10, 30]:
+            for tenor in [0.25, 0.5, 1, 2, 5, 10, 30]:
                 try:
                     zero_rate = self.curve.zeroRate(tenor, ql.Continuous).rate() * 100
                     print(f"   {tenor}Y: {zero_rate:.4f}%")
                 except:
                     pass
             
+            print(f"{'='*60}\n")
+            
             return self.curve
             
         except Exception as e:
-            print(f"❌ Curve bootstrapping failed: {e}")
+            print(f"\n❌ Curve bootstrapping failed: {e}")
+            print(f"{'='*60}\n")
             raise
-    
-    def _parse_tenor_to_years(self, tenor_str):
-        """
-        Parse tenor string to years
-        """
-        tenor_str = tenor_str.upper().strip()
-        
-        if tenor_str.endswith('M'):
-            months = int(tenor_str[:-1])
-            return months / 12.0
-        elif tenor_str.endswith('Y'):
-            years = int(tenor_str[:-1])
-            return float(years)
-        else:
-            return 0.0
     
     def _get_max_maturity(self):
         """
