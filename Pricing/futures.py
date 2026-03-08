@@ -49,7 +49,7 @@ class FuturesPricer:
         else:
             dc = ql.Actual360()
         
-        # Calculate IMM date (futures settlement)
+        # Calculate IMM date (futures settlement) based on maturity period
         imm_date = self._get_imm_date(period)
         
         # Create futures rate helper
@@ -83,9 +83,22 @@ class FuturesPricer:
     def _get_imm_date(self, period):
         """
         Calculate IMM date (third Wednesday) for futures settlement
+        Futures settle on IMM dates, but for different tenors we need different IMM dates
+        
+        For a period (e.g., 3M), find the IMM date that's approximately that far from eval_date
         """
-        maturity_date = self.eval_date + period
-        return ql.IMM.nextDate(self.eval_date)
+        # Calculate approximate target date
+        target_date = self.eval_date + period
+        
+        # Find the IMM date on or after the target date
+        # IMM dates are 3rd Wednesday of Mar, Jun, Sep, Dec
+        imm_date = ql.IMM.nextDate(target_date - ql.Period(1, ql.Months))
+        
+        # If that's too far in the past, get the next one
+        while imm_date < self.eval_date:
+            imm_date = ql.IMM.nextDate(imm_date + ql.Period(1, ql.Days))
+        
+        return imm_date
     
     def price_futures(self, price, notional=1000000, tick_value=25):
         """
