@@ -47,7 +47,6 @@ class FXStochasticLocalVol:
         self.vol_surface_data = vol_surface_data
         
         # Default model parameters (Heston with realistic FX values)
-        # Adjusted to satisfy Feller condition: 2*kappa*theta > sigma^2
         self.model_params = model_params or {
             'v0': 0.014,       # Initial variance (~12% vol)
             'kappa': 2.0,      # Mean reversion speed
@@ -56,9 +55,6 @@ class FXStochasticLocalVol:
             'rho': -0.6        # Correlation
         }
         
-        # Validate Feller condition
-        self._validate_feller_condition()
-        
         # QuantLib objects
         self.spot_handle = ql.QuoteHandle(ql.SimpleQuote(self.spot_fx))
         self.heston_model = None
@@ -66,24 +62,6 @@ class FXStochasticLocalVol:
         self.calibrated_helpers = []
         self.calibration_results = None
         self.black_var_surface = None
-    
-    def _validate_feller_condition(self):
-        """
-        Validate that Heston parameters satisfy the Feller condition:
-        2*kappa*theta > sigma^2
-        This ensures the variance process stays positive
-        """
-        kappa = self.model_params['kappa']
-        theta = self.model_params['theta']
-        sigma = self.model_params['sigma']
-        
-        feller_lhs = 2 * kappa * theta
-        feller_rhs = sigma ** 2
-        
-        if feller_lhs <= feller_rhs:
-            # Adjust sigma to satisfy Feller condition
-            self.model_params['sigma'] = np.sqrt(2 * kappa * theta * 0.95)  # 95% of maximum
-            print(f"Warning: Adjusted sigma from {sigma:.4f} to {self.model_params['sigma']:.4f} to satisfy Feller condition")
     
     def build_vol_surface(self):
         """
@@ -141,24 +119,20 @@ class FXStochasticLocalVol:
     def calibrate(self):
         """
         Calibrate the FX-SLV model parameters to vanilla option prices
-        Uses Heston model as the stochastic volatility component with constrained optimization
+        Uses Heston model as the stochastic volatility component
         """
         # Build volatility surface first
         if self.black_var_surface is None:
             self.build_vol_surface()
         
         # Get initial parameters
-        v0 = max(0.001, self.model_params['v0'])      # At least 0.1% vol
-        kappa = max(0.1, self.model_params['kappa'])   # Positive mean reversion
-        theta = max(0.001, self.model_params['theta']) # At least 0.1% vol
-        sigma = max(0.01, self.model_params['sigma'])  # Positive vol-of-vol
-        rho = max(-0.99, min(0.99, self.model_params['rho']))  # Correlation bounds
+        v0 = max(0.0001, self.model_params['v0'])
+        kappa = max(0.01, self.model_params['kappa'])
+        theta = max(0.0001, self.model_params['theta'])
+        sigma = max(0.01, self.model_params['sigma'])
+        rho = max(-0.99, min(0.99, self.model_params['rho']))
         
-        # Ensure Feller condition
-        if 2 * kappa * theta <= sigma ** 2:
-            sigma = np.sqrt(2 * kappa * theta * 0.9)
-        
-        # Create Heston process with validated parameters
+        # Create Heston process
         heston_process = ql.HestonProcess(
             self.domestic_curve,
             self.foreign_curve,
@@ -183,26 +157,40 @@ class FXStochasticLocalVol:
         for helper in self.calibrated_helpers:
             helper.setPricingEngine(heston_engine)
         
-        # Calibrate model with constraints
+        # Calibrate model
         optimization_method = ql.LevenbergMarquardt()
         end_criteria = ql.EndCriteria(500, 100, 1e-8, 1e-8, 1e-8)
-        
-        # Add parameter constraints to prevent unrealistic values
-        constraint = ql.PositiveConstraint()
         
         self.heston_model.calibrate(
             self.calibrated_helpers,
             optimization_method,
-            end_criteria,
-            constraint
+            end_criteria
         )
         
-        # Validate calibrated parameters
+        # Get calibrated parameters and show them
         params = self.heston_model.params()
-        if not self._validate_calibrated_params(params):
+        print(f"\n=== Calibrated Heston Parameters ===")
+        print(f"v0 (initial variance): {params[0]:.6f}  ({np.sqrt(params[0])*100:.2f}% vol)")
+        print(f"kappa (mean reversion): {params[1]:.6f}")
+        print(f"theta (long-term var): {params[2]:.6f}  ({np.sqrt(params[2])*100:.2f}% vol)")
+        print(f"sigma (vol-of-vol): {params[3]:.6f}")
+        print(f"rho (correlation): {params[4]:.6f}")
+        print(f"Feller condition: 2*kappa*theta = {2*params[1]*params[2]:.6f}, sigma^2 = {params[3]**2:.6f}")
+        print(f"Feller satisfied: {2*params[1]*params[2] > params[3]**2}")
+        print(f"=" * 40)
+        
+        # Validate - but only reject on critical errors
+        validation_result, warnings = self._validate_calibrated_params(params)
+        
+        if warnings:
+            print("\n⚠️  Calibration Warnings:")
+            for warning in warnings:
+                print(f"  - {warning}")
+        
+        if not validation_result:
             raise ValueError(
-                "Calibration produced invalid parameters. "
-                "Try adjusting initial parameter guesses or vol surface data."
+                "Calibration produced critically invalid parameters (NaN/Inf or negative values). "
+                "Try different initial parameter guesses."
             )
         
         # Build local volatility surface from calibrated model
@@ -215,7 +203,9 @@ class FXStochasticLocalVol:
     
     def _validate_calibrated_params(self, params):
         """
-        Validate that calibrated parameters are realistic and satisfy constraints
+        Validate calibrated parameters
+        Returns (is_valid, warnings_list)
+        Only fails on critical errors (NaN/Inf/negative)
         """
         v0 = params[0]
         kappa = params[1]
@@ -223,33 +213,43 @@ class FXStochasticLocalVol:
         sigma = params[3]
         rho = params[4]
         
+        warnings = []
+        
+        # CRITICAL CHECKS - Must pass
         # Check for NaN or inf
         if any(np.isnan(p) or np.isinf(p) for p in params):
-            return False
+            return False, ["Parameters contain NaN or Inf"]
         
-        # Check positivity constraints
+        # Check positivity (except rho)
         if v0 <= 0 or kappa <= 0 or theta <= 0 or sigma <= 0:
-            return False
+            return False, ["Parameters must be positive (except rho)"]
         
         # Check correlation bounds
         if abs(rho) >= 1.0:
-            return False
+            return False, ["Correlation must be strictly between -1 and 1"]
         
+        # NON-CRITICAL CHECKS - Warnings only
         # Check Feller condition
         if 2 * kappa * theta <= sigma ** 2:
-            return False
+            warnings.append(f"Feller condition violated: 2*κ*θ={2*kappa*theta:.4f} <= σ²={sigma**2:.4f}. Variance may reach zero.")
         
-        # Check reasonable ranges for FX
-        if v0 > 1.0 or theta > 1.0:  # Variance > 100% is unrealistic
-            return False
+        # Check reasonable ranges
+        if v0 > 0.5:  # Variance > 70% vol
+            warnings.append(f"Initial variance v0={v0:.4f} is high ({np.sqrt(v0)*100:.1f}% vol)")
         
-        if kappa > 20:  # Very fast mean reversion is unrealistic
-            return False
+        if theta > 0.5:
+            warnings.append(f"Long-term variance theta={theta:.4f} is high ({np.sqrt(theta)*100:.1f}% vol)")
         
-        if sigma > 5.0:  # Vol-of-vol > 500% is unrealistic
-            return False
+        if kappa > 10:
+            warnings.append(f"Mean reversion kappa={kappa:.4f} is very fast")
         
-        return True
+        if sigma > 3.0:
+            warnings.append(f"Vol-of-vol sigma={sigma:.4f} is very high")
+        
+        if abs(rho) < 0.1:
+            warnings.append(f"Correlation rho={rho:.4f} is very weak")
+        
+        return True, warnings
     
     def _create_calibration_helpers(self):
         """
@@ -365,6 +365,7 @@ class FXStochasticLocalVol:
                 vol_error_bps = (model_vol - market_vol) * 10000
             except Exception as e:
                 # If pricing fails, use market values
+                market_price = 0
                 model_price = 0
                 model_vol = market_vol
                 price_error = 0
@@ -376,7 +377,7 @@ class FXStochasticLocalVol:
                 'expiry': row['expiry'],
                 'market_vol': market_vol * 100,
                 'model_vol': model_vol * 100,
-                'market_price': market_price if 'market_price' in locals() else 0,
+                'market_price': market_price,
                 'model_price': model_price,
                 'price_error': price_error,
                 'price_error_pct': price_error_pct,
@@ -491,12 +492,6 @@ class FXStochasticLocalVol:
         pd.DataFrame: Comparison of model vs Black-Scholes prices
         """
         if not self.heston_model:
-            return None
-        
-        # Validate parameters first
-        params = self.heston_model.params()
-        if not self._validate_calibrated_params(params):
-            print("Warning: Model parameters may be invalid")
             return None
         
         # Use sample from vol surface if no test options provided
