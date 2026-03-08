@@ -32,7 +32,7 @@ def render_fx_slv_section():
         return
     
     fx_curves = st.session_state.fx_curves
-    spot_fx = st.session_state.spot_fx
+    spot_fx = fx_curves.spot_fx  # Get spot_fx from fx_curves object
     
     st.markdown("---")
     
@@ -102,7 +102,7 @@ def render_fx_slv_section():
             height=600
         )
         
-        st.plotly_chart(fig_vol_surface, width='stretch', key="fx_vol_surface_3d")
+        st.plotly_chart(fig_vol_surface, use_container_width=True, key="fx_vol_surface_3d")
         
         # 2D smile plot
         st.write("**Volatility Smiles by Expiry**")
@@ -140,7 +140,7 @@ def render_fx_slv_section():
             hovermode='x unified'
         )
         
-        st.plotly_chart(fig_smiles, width='stretch', key="fx_vol_smiles")
+        st.plotly_chart(fig_smiles, use_container_width=True, key="fx_vol_smiles")
     
     st.markdown("---")
     
@@ -313,7 +313,7 @@ def render_fx_slv_section():
                     hovermode='closest'
                 )
                 
-                st.plotly_chart(fig_vols, width='stretch', key="fx_slv_vols_chart")
+                st.plotly_chart(fig_vols, use_container_width=True, key="fx_slv_vols_chart")
                 
                 # Volatility errors
                 st.write("**Volatility Errors**")
@@ -341,7 +341,7 @@ def render_fx_slv_section():
                     xaxis_tickangle=-45
                 )
                 
-                st.plotly_chart(fig_vol_errors, width='stretch', key="fx_slv_vol_errors_chart")
+                st.plotly_chart(fig_vol_errors, use_container_width=True, key="fx_slv_vol_errors_chart")
                 
                 # Error statistics
                 col1, col2, col3, col4 = st.columns(4)
@@ -450,7 +450,7 @@ def render_fx_slv_section():
                             height=500
                         )
                         
-                        st.plotly_chart(fig_vol, width='stretch', key="fx_slv_vol_paths")
+                        st.plotly_chart(fig_vol, use_container_width=True, key="fx_slv_vol_paths")
                         
                         # Statistics
                         col1, col2, col3 = st.columns(3)
@@ -506,7 +506,7 @@ def render_fx_slv_section():
                                 height=500
                             )
                             
-                            st.plotly_chart(fig_val, width='stretch', key="fx_slv_val_chart")
+                            st.plotly_chart(fig_val, use_container_width=True, key="fx_slv_val_chart")
                             
                             # Error plot
                             fig_val_error = go.Figure()
@@ -528,11 +528,11 @@ def render_fx_slv_section():
                                 xaxis_tickangle=-45
                             )
                             
-                            st.plotly_chart(fig_val_error, width='stretch', key="fx_slv_val_error_chart")
+                            st.plotly_chart(fig_val_error, use_container_width=True, key="fx_slv_val_error_chart")
                             
                             # Display table
                             st.write("**Validation Results**")
-                            st.dataframe(validation_results, uwidth='stretch', hide_index=True)
+                            st.dataframe(validation_results, use_container_width=True, hide_index=True)
             
             with tab4:
                 st.write("**Detailed Calibration Results**")
@@ -549,7 +549,7 @@ def render_fx_slv_section():
                     'Market Price', 'Model Price', 'Price Error', 'Price Error (%)'
                 ]
                 
-                st.dataframe(display_errors, width='stretch', hide_index=True)
+                st.dataframe(display_errors, use_container_width=True, hide_index=True)
     
     else:
         st.info("Click 'Calibrate FX-SLV Model' to see results")
