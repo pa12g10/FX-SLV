@@ -1,0 +1,9 @@
+# FX-SLV Requirements
+# Core dependencies for FX Stochastic Local Volatility model and GUI
+
+QuantLib>=1.31
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.17.0
+scipy>=1.11.0
