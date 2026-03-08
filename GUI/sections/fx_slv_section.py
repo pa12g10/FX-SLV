@@ -318,7 +318,7 @@ def render_fx_slv_section():
                 fx_slv.calibrate()
                 
                 st.session_state.fx_slv_model = fx_slv
-                st.session_state.fx_slv_calib_mode = calibration_mode
+                st.session_state.fx_slv_calib_mode_used = calibration_mode  # Different key to avoid conflict
                 
                 st.success("✅ FX-SLV model calibrated successfully!")
                 
@@ -334,8 +334,8 @@ def render_fx_slv_section():
         st.subheader("FX-SLV Calibration Results")
         
         # Show calibration mode used
-        if 'fx_slv_calib_mode' in st.session_state:
-            st.caption(f"Calibrated using: {st.session_state.fx_slv_calib_mode}")
+        if 'fx_slv_calib_mode_used' in st.session_state:
+            st.caption(f"Calibrated using: {st.session_state.fx_slv_calib_mode_used}")
         
         fx_slv = st.session_state.fx_slv_model
         results = fx_slv.get_calibrated_results()
