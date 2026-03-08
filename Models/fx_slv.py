@@ -81,29 +81,25 @@ class FXStochasticLocalVol:
             expiries = [d[1] for d in self.vol_surface_data]
             vols = [d[2] for d in self.vol_surface_data]
         
-        # Convert expiries to dates
-        expiry_dates = [self.eval_date + ql.Period(int(e*365), ql.Days) for e in expiries]
-        
-        # Create Black variance surface
-        # Group by expiry to create matrix structure
+        # Get unique strikes and expiries, sorted
         expiry_set = sorted(set(expiries))
         strike_set = sorted(set(strikes))
         
         expiry_dates_unique = [self.eval_date + ql.Period(int(e*365), ql.Days) for e in expiry_set]
         
-        # Build vol matrix
+        # Build vol matrix (strikes x expiries)
         vol_matrix = ql.Matrix(len(strike_set), len(expiry_set))
         
         for i, strike in enumerate(strike_set):
             for j, expiry in enumerate(expiry_set):
                 # Find vol for this strike/expiry combo
                 matching_vols = [vols[k] for k in range(len(vols)) 
-                               if strikes[k] == strike and expiries[k] == expiry]
+                               if abs(strikes[k] - strike) < 1e-6 and abs(expiries[k] - expiry) < 1e-6]
                 if matching_vols:
                     vol_matrix[i][j] = matching_vols[0]
                 else:
-                    # Interpolate or use nearby value
-                    vol_matrix[i][j] = 0.15  # Default fallback
+                    # Fallback to nearby or default
+                    vol_matrix[i][j] = 0.12  # Default 12%
         
         # Create Black variance surface
         self.black_var_surface = ql.BlackVarianceSurface(
@@ -114,6 +110,9 @@ class FXStochasticLocalVol:
             vol_matrix,
             day_counter
         )
+        
+        # Enable extrapolation
+        self.black_var_surface.enableExtrapolation()
         
         return self.black_var_surface
     
@@ -196,7 +195,6 @@ class FXStochasticLocalVol:
             volatility = row['volatility']
             
             # Create option helper
-            expiry_date = self.eval_date + ql.Period(int(expiry_years * 365), ql.Days)
             maturity = ql.Period(int(expiry_years * 365), ql.Days)
             
             # Determine if call or put (use put for below spot, call for above)
@@ -221,20 +219,20 @@ class FXStochasticLocalVol:
         """
         Build local volatility surface using Dupire's formula
         """
-        # Use the calibrated Heston model to generate implied vols
-        # Then apply Dupire formula to get local vols
-        
-        calendar = ql.TARGET()
-        day_counter = ql.Actual365Fixed()
-        
         # Create local vol surface from Black variance surface
         if self.black_var_surface:
+            # Use BlackVolTermStructureHandle (correct QuantLib API)
+            black_vol_handle = ql.BlackVolTermStructureHandle(self.black_var_surface)
+            
             self.local_vol_surface = ql.LocalVolSurface(
-                ql.BlackVarianceSurfaceHandle(self.black_var_surface),
+                black_vol_handle,
                 self.domestic_curve,
                 self.foreign_curve,
                 self.spot_handle
             )
+            
+            # Enable extrapolation
+            self.local_vol_surface.enableExtrapolation()
         
         return self.local_vol_surface
     
@@ -408,7 +406,8 @@ class FXStochasticLocalVol:
         # Use sample from vol surface if no test options provided
         if test_options is None:
             if isinstance(self.vol_surface_data, pd.DataFrame):
-                sample = self.vol_surface_data.sample(min(5, len(self.vol_surface_data)))
+                sample_size = min(5, len(self.vol_surface_data))
+                sample = self.vol_surface_data.sample(sample_size) if len(self.vol_surface_data) > 5 else self.vol_surface_data
                 test_options = [[row['strike'], row['expiry'], 'call'] 
                               for _, row in sample.iterrows()]
             else:
@@ -435,14 +434,19 @@ class FXStochasticLocalVol:
             heston_price = option.NPV()
             
             # Get market vol for this strike/expiry
-            market_vol = 0.15  # Default
+            market_vol = 0.12  # Default
             if isinstance(self.vol_surface_data, pd.DataFrame):
                 matching = self.vol_surface_data[
-                    (self.vol_surface_data['strike'] == strike) & 
-                    (self.vol_surface_data['expiry'] == expiry)
+                    (abs(self.vol_surface_data['strike'] - strike) < 1e-6) & 
+                    (abs(self.vol_surface_data['expiry'] - expiry) < 1e-6)
                 ]
                 if not matching.empty:
                     market_vol = matching.iloc[0]['volatility']
+            else:
+                for d in self.vol_surface_data:
+                    if abs(d[0] - strike) < 1e-6 and abs(d[1] - expiry) < 1e-6:
+                        market_vol = d[2]
+                        break
             
             # Price with Black-Scholes
             bs_process = ql.BlackScholesMertonProcess(
