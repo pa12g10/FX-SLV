@@ -50,7 +50,6 @@ class SwapPricer:
         
         # Payment frequencies
         fixed_leg_freq = self._parse_frequency(fixed_freq)
-        float_leg_freq = self._parse_frequency(float_freq)
         
         # Day count convention
         if day_count == 'Actual/360':
@@ -60,19 +59,19 @@ class SwapPricer:
         else:
             dc = ql.Actual360()
         
-        # Create OIS rate helper
+        # Create OIS rate helper with correct signature:
+        # OISRateHelper(settlementDays, tenor, quote, overnightIndex, 
+        #               discountingCurve, telescopicValueDates,
+        #               paymentLag, paymentConvention, paymentFrequency,
+        #               paymentCalendar, forwardStart, overnightSpread, pillarChoice, customPillarDate)
+        
         helper = ql.OISRateHelper(
             2,  # Settlement days
-            period,
-            ql.QuoteHandle(ql.SimpleQuote(rate_decimal)),
-            ql.Sofr(),  # OIS index (SOFR)
-            curve_handle,
-            False,
-            2,
-            ql.Following,
-            fixed_leg_freq,
-            ql.TARGET(),
-            dc
+            period,  # Tenor as Period
+            ql.QuoteHandle(ql.SimpleQuote(rate_decimal)),  # Rate quote
+            ql.Sofr(),  # Overnight index (SOFR)
+            curve_handle  # Discounting curve
+            # Use defaults for remaining optional parameters
         )
         
         return helper
