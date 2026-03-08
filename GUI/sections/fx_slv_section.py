@@ -32,7 +32,7 @@ def render_fx_slv_section():
         return
     
     fx_curves = st.session_state.fx_curves
-    spot_fx = fx_curves.spot_fx  # Get spot_fx from fx_curves object
+    spot_fx = fx_curves.spot_fx
     
     st.markdown("---")
     
@@ -223,14 +223,18 @@ def render_fx_slv_section():
                     'rho': rho
                 }
                 
+                # Create curve handles from the curves
+                domestic_curve_handle = ql.YieldTermStructureHandle(fx_curves.usd_curve)
+                foreign_curve_handle = ql.YieldTermStructureHandle(fx_curves.eur_curve)
+                
                 # Create and calibrate model
                 eval_date = ql.Date(8, 3, 2026)
                 
                 fx_slv = FXStochasticLocalVol(
                     eval_date,
                     spot_fx,
-                    fx_curves.domestic_curve_handle,
-                    fx_curves.foreign_curve_handle,
+                    domestic_curve_handle,
+                    foreign_curve_handle,
                     vol_surface_data,
                     model_params
                 )
