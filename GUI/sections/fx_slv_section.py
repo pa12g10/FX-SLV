@@ -148,49 +148,67 @@ def render_fx_slv_section():
     st.subheader("FX-SLV Model Parameters")
     st.info("💡 The FX-SLV model uses Heston stochastic volatility combined with local volatility (Dupire). Parameters will be calibrated to market volatilities.")
     
+    # Calibration mode selection
+    st.write("**Calibration Settings**")
+    calibration_mode = st.radio(
+        "Calibration Mode",
+        options=["ATM Only (Recommended)", "Full Surface"],
+        index=0,
+        help="ATM Only: Calibrates to 4 ATM options only (better fit, faster). Full Surface: Uses all strikes (may overfit).",
+        horizontal=True,
+        key="fx_slv_calib_mode"
+    )
+    
+    if calibration_mode == "ATM Only (Recommended)":
+        st.success("✅ ATM-only calibration provides better quality with 5 Heston parameters. Expected RMSE: < 20 bps")
+    else:
+        st.warning("⚠️ Full surface calibration with 20 options may result in larger errors (RMSE > 30 bps)")
+    
+    st.write("**Initial Parameter Guesses (FX-typical values)**")
+    
     col1, col2 = st.columns(2)
     
     with col1:
         v0 = st.number_input(
             "Initial Variance (v0)",
-            value=0.01,
+            value=0.014,  # Updated: 12% vol typical for FX
             format="%.4f",
-            help="Initial variance (vol^2)",
+            help="Initial variance (vol^2). Default: 0.014 = 12% vol",
             key="fx_slv_v0"
         )
         
         kappa = st.number_input(
             "Mean Reversion (κ)",
-            value=1.0,
+            value=2.0,  # Updated: faster mean reversion typical for FX
             format="%.4f",
-            help="Mean reversion speed of variance",
+            help="Mean reversion speed of variance. Higher = faster return to long-term vol",
             key="fx_slv_kappa"
         )
         
         theta = st.number_input(
             "Long-term Variance (θ)",
-            value=0.01,
+            value=0.014,  # Updated: 12% long-term vol
             format="%.4f",
-            help="Long-term variance level",
+            help="Long-term variance level. Default: 0.014 = 12% vol",
             key="fx_slv_theta"
         )
     
     with col2:
         sigma = st.number_input(
             "Vol-of-Vol (σ)",
-            value=0.3,
+            value=0.4,  # Updated: higher vol-of-vol for FX
             format="%.4f",
-            help="Volatility of variance (vol-of-vol)",
+            help="Volatility of variance (vol-of-vol). FX typically 0.3-0.5",
             key="fx_slv_sigma"
         )
         
         rho = st.number_input(
             "Correlation (ρ)",
-            value=-0.7,
+            value=-0.6,  # Updated: moderate negative correlation
             min_value=-1.0,
             max_value=1.0,
             format="%.4f",
-            help="Correlation between spot and volatility",
+            help="Correlation between spot and volatility. Negative = inverse relationship",
             key="fx_slv_rho"
         )
     
@@ -205,9 +223,25 @@ def render_fx_slv_section():
     if st.button("Calibrate FX-SLV Model", type="primary", key="fx_slv_calibrate_btn"):
         with st.spinner("Calibrating FX-SLV model to volatility surface..."):
             try:
+                # Filter volatility surface based on calibration mode
+                if calibration_mode == "ATM Only (Recommended)":
+                    # Select ATM options only (strike closest to spot)
+                    atm_options = []
+                    for expiry in vol_surface_df['Expiry (Years)'].unique():
+                        expiry_data = vol_surface_df[vol_surface_df['Expiry (Years)'] == expiry]
+                        # Find strike closest to spot
+                        atm_row = expiry_data.iloc[(expiry_data['Strike'] - spot_fx).abs().argmin()]
+                        atm_options.append(atm_row)
+                    
+                    calibration_df = pd.DataFrame(atm_options)
+                    st.info(f"🎯 Calibrating to {len(calibration_df)} ATM options")
+                else:
+                    calibration_df = vol_surface_df
+                    st.info(f"🎯 Calibrating to {len(calibration_df)} options (full surface)")
+                
                 # Prepare volatility surface data
                 vol_surface_data = []
-                for _, row in vol_surface_df.iterrows():
+                for _, row in calibration_df.iterrows():
                     vol_surface_data.append([
                         row['Strike'],
                         row['Expiry (Years)'],
@@ -242,6 +276,7 @@ def render_fx_slv_section():
                 fx_slv.calibrate()
                 
                 st.session_state.fx_slv_model = fx_slv
+                st.session_state.fx_slv_calib_mode = calibration_mode
                 
                 st.success("✅ FX-SLV model calibrated successfully!")
                 
@@ -256,6 +291,10 @@ def render_fx_slv_section():
     if st.session_state.fx_slv_model is not None:
         st.subheader("FX-SLV Calibration Results")
         
+        # Show calibration mode used
+        if 'fx_slv_calib_mode' in st.session_state:
+            st.caption(f"Calibrated using: {st.session_state.fx_slv_calib_mode}")
+        
         fx_slv = st.session_state.fx_slv_model
         results = fx_slv.get_calibrated_results()
         
@@ -265,11 +304,11 @@ def render_fx_slv_section():
             col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
-                st.metric("v0", f"{results['v0']:.6f}")
+                st.metric("v0", f"{results['v0']:.6f}", help=f"Vol: {np.sqrt(results['v0'])*100:.2f}%")
             with col2:
                 st.metric("κ", f"{results['kappa']:.6f}")
             with col3:
-                st.metric("θ", f"{results['theta']:.6f}")
+                st.metric("θ", f"{results['theta']:.6f}", help=f"Vol: {np.sqrt(results['theta'])*100:.2f}%")
             with col4:
                 st.metric("σ", f"{results['sigma']:.6f}")
             with col5:
@@ -287,6 +326,26 @@ def render_fx_slv_section():
             
             with tab1:
                 errors_df = results['pricing_errors']
+                
+                # Calibration quality assessment
+                rmse = np.sqrt((errors_df['vol_error_bps']**2).mean())
+                max_error = errors_df['vol_error_bps'].abs().max()
+                
+                if rmse < 10:
+                    quality_msg = "🌟 Excellent calibration quality (RMSE < 10 bps)"
+                    quality_color = "green"
+                elif rmse < 20:
+                    quality_msg = "✅ Good calibration quality (RMSE < 20 bps)"
+                    quality_color = "blue"
+                elif rmse < 30:
+                    quality_msg = "⚠️ Acceptable calibration (RMSE < 30 bps)"
+                    quality_color = "orange"
+                else:
+                    quality_msg = "❌ Poor calibration (RMSE > 30 bps). Try ATM-only mode."
+                    quality_color = "red"
+                
+                st.markdown(f":{quality_color}[**{quality_msg}**]")
+                st.write("")
                 
                 # Market vs Model volatilities
                 st.write("**Market vs Model Implied Volatilities**")
@@ -350,11 +409,11 @@ def render_fx_slv_section():
                 # Error statistics
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Max Vol Error", f"{errors_df['vol_error_bps'].abs().max():.2f} bps")
+                    st.metric("Max Vol Error", f"{max_error:.2f} bps")
                 with col2:
                     st.metric("Mean Vol Error", f"{errors_df['vol_error_bps'].mean():.2f} bps")
                 with col3:
-                    st.metric("RMSE (Vol)", f"{np.sqrt((errors_df['vol_error_bps']**2).mean()):.2f} bps")
+                    st.metric("RMSE (Vol)", f"{rmse:.2f} bps")
                 with col4:
                     st.metric("Std Dev", f"{errors_df['vol_error_bps'].std():.2f} bps")
             
