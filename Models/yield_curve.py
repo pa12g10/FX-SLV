@@ -16,45 +16,29 @@ class YieldCurveBuilder:
     """
     
     def __init__(self, eval_date, currency='USD'):
-        """
-        Initialize yield curve builder
-        
-        Parameters:
-        -----------
-        eval_date : QuantLib.Date
-            Evaluation date
-        currency : str
-            Currency code (USD, EUR, etc.)
-        """
         self.eval_date = eval_date
         self.currency = currency
         self.curve = None
         self.helpers = []
         
-        # Set QuantLib evaluation date
         ql.Settings.instance().evaluationDate = eval_date
         
-        # Initialize pricers
         self.deposit_pricer = DepositPricer(eval_date)
         self.futures_pricer = FuturesPricer(eval_date)
         self.swap_pricer = SwapPricer(eval_date)
     
     def bootstrap_curve(self, deposit_data, futures_data, swaps_data):
         """
-        Bootstrap yield curve from market instruments
-        
-        Parameters:
-        -----------
+        Bootstrap yield curve from market instruments.
+
+        Parameters
+        ----------
         deposit_data : dict
-            Deposit data with keys: tenor, rate, day_count
+            Keys: tenor, rate, day_count
         futures_data : pandas.DataFrame
-            Futures data with columns: maturity, price, day_count
+            Columns: contract, tenor, price, day_count
         swaps_data : pandas.DataFrame
-            Swaps data with columns: tenor, rate, fixed_freq, float_freq, day_count
-        
-        Returns:
-        --------
-        QuantLib.YieldTermStructure: Bootstrapped curve
+            Columns: tenor, rate, fixed_freq, float_freq, day_count
         """
         print(f"\n{'='*60}")
         print(f"Bootstrapping {self.currency} Curve")
@@ -63,17 +47,14 @@ class YieldCurveBuilder:
         self.helpers = []
         used_pillar_dates = set()
         
-        # Create flat forward curve for swap helpers
+        # Flat forward used as initial curve for swap helpers
         initial_rate = swaps_data.iloc[0]['rate'] / 100.0
         flat_forward = ql.FlatForward(
-            self.eval_date,
-            initial_rate,
-            ql.Actual360(),
-            ql.Continuous
+            self.eval_date, initial_rate, ql.Actual360(), ql.Continuous
         )
         curve_handle = ql.YieldTermStructureHandle(flat_forward)
         
-        # 1. Add deposit
+        # 1. Deposit
         print(f"\nAdding Deposits:")
         try:
             helper = self.deposit_pricer.create_helper(
@@ -81,44 +62,43 @@ class YieldCurveBuilder:
                 day_count=deposit_data['day_count']
             )
             pillar_date = helper.latestDate()
-            
             if pillar_date not in used_pillar_dates:
                 self.helpers.append(helper)
                 used_pillar_dates.add(pillar_date)
-                print(f"  ON @ {deposit_data['rate']:.2f}% → pillar {pillar_date}")
+                print(f"  ON @ {deposit_data['rate']:.2f}% -> pillar {pillar_date}")
             else:
-                print(f"  ON @ {deposit_data['rate']:.2f}% → SKIP (duplicate {pillar_date})")
+                print(f"  ON @ {deposit_data['rate']:.2f}% -> SKIP (duplicate {pillar_date})")
         except Exception as e:
             print(f"  ON: ERROR - {e}")
         
-        # 2. Add futures (check each for duplicate pillars)
+        # 2. Futures  (column is 'tenor', was previously 'maturity')
         print(f"\nAdding Futures:")
         for idx, row in futures_data.iterrows():
+            tenor_label = row['tenor']          # <-- fixed: was row['maturity']
             try:
                 helper = self.futures_pricer.create_helper(
-                    maturity=row['maturity'],
+                    maturity=tenor_label,
                     price=row['price'],
                     day_count=row['day_count']
                 )
                 pillar_date = helper.latestDate()
                 
-                # Check if this pillar date is too close to any existing date
                 too_close = False
                 for existing_date in used_pillar_dates:
                     days_apart = abs(pillar_date - existing_date)
-                    if days_apart <= 7:  # Within 1 week
-                        print(f"  {row['maturity']}: SKIP (pillar {pillar_date} within {days_apart} days of {existing_date})")
+                    if days_apart <= 7:
+                        print(f"  {tenor_label}: SKIP (pillar {pillar_date} within {days_apart}d of {existing_date})")
                         too_close = True
                         break
                 
                 if not too_close:
                     self.helpers.append(helper)
                     used_pillar_dates.add(pillar_date)
-                    print(f"  {row['maturity']} @ {row['price']:.2f} → pillar {pillar_date}")
+                    print(f"  {tenor_label} @ {row['price']:.2f} -> pillar {pillar_date}")
             except Exception as e:
-                print(f"  {row['maturity']}: ERROR - {e}")
+                print(f"  {tenor_label}: ERROR - {e}")
         
-        # 3. Add swaps (check each for duplicate pillars)
+        # 3. OIS Swaps
         print(f"\nAdding OIS Swaps:")
         for idx, row in swaps_data.iterrows():
             try:
@@ -131,34 +111,27 @@ class YieldCurveBuilder:
                     day_count=row['day_count']
                 )
                 pillar_date = helper.latestDate()
-                
                 if pillar_date not in used_pillar_dates:
                     self.helpers.append(helper)
                     used_pillar_dates.add(pillar_date)
-                    print(f"  {row['tenor']} @ {row['rate']:.2f}% → pillar {pillar_date}")
+                    print(f"  {row['tenor']} @ {row['rate']:.2f}% -> pillar {pillar_date}")
                 else:
-                    print(f"  {row['tenor']} @ {row['rate']:.2f}% → SKIP (duplicate {pillar_date})")
+                    print(f"  {row['tenor']} @ {row['rate']:.2f}% -> SKIP (duplicate {pillar_date})")
             except Exception as e:
                 print(f"  {row['tenor']}: ERROR - {e}")
         
-        # 4. Bootstrap the curve
+        # 4. Bootstrap
         print(f"\nBootstrapping with {len(self.helpers)} instruments...")
-        
         try:
             self.curve = ql.PiecewiseLogLinearDiscount(
-                self.eval_date,
-                self.helpers,
-                ql.Actual360()
+                self.eval_date, self.helpers, ql.Actual360()
             )
-            
-            # Enable extrapolation
             self.curve.enableExtrapolation()
             
-            print(f"\n✅ {self.currency} curve bootstrapped successfully!")
+            print(f"\n\u2705 {self.currency} curve bootstrapped successfully!")
             print(f"   Instruments used: {len(self.helpers)}")
             print(f"   Max maturity: {self._get_max_maturity():.1f} years")
             
-            # Print sample rates
             print(f"\nSample Zero Rates:")
             for tenor in [0.25, 0.5, 1, 2, 5, 10, 30]:
                 try:
@@ -168,206 +141,96 @@ class YieldCurveBuilder:
                     pass
             
             print(f"{'='*60}\n")
-            
             return self.curve
             
         except Exception as e:
-            print(f"\n❌ Curve bootstrapping failed: {e}")
+            print(f"\n\u274c Curve bootstrapping failed: {e}")
             print(f"{'='*60}\n")
             raise
     
     def _get_max_maturity(self):
-        """
-        Get maximum maturity from helpers
-        """
         if not self.helpers:
             return 0.0
-        max_date = max([helper.latestDate() for helper in self.helpers])
+        max_date = max([h.latestDate() for h in self.helpers])
         return ql.Actual360().yearFraction(self.eval_date, max_date)
     
     def get_zero_rates(self, tenors):
-        """
-        Get zero rates for specified tenors
-        
-        Parameters:
-        -----------
-        tenors : array-like
-            Tenors in years
-        
-        Returns:
-        --------
-        numpy.array: Zero rates (as decimals)
-        """
         if self.curve is None:
             raise ValueError("Curve not bootstrapped yet. Call bootstrap_curve() first.")
-        
         zero_rates = []
         for t in tenors:
             try:
-                rate = self.curve.zeroRate(t, ql.Continuous).rate()
-                zero_rates.append(rate)
+                zero_rates.append(self.curve.zeroRate(t, ql.Continuous).rate())
             except:
                 zero_rates.append(np.nan)
-        
         return np.array(zero_rates)
     
     def get_discount_factors(self, tenors):
-        """
-        Get discount factors for specified tenors
-        
-        Parameters:
-        -----------
-        tenors : array-like
-            Tenors in years
-        
-        Returns:
-        --------
-        numpy.array: Discount factors
-        """
         if self.curve is None:
             raise ValueError("Curve not bootstrapped yet. Call bootstrap_curve() first.")
-        
         dfs = []
         for t in tenors:
             try:
-                df = self.curve.discount(t)
-                dfs.append(df)
+                dfs.append(self.curve.discount(t))
             except:
                 dfs.append(np.nan)
-        
         return np.array(dfs)
     
     def get_forward_rates(self, start_tenors, end_tenors):
-        """
-        Get forward rates between periods
-        
-        Parameters:
-        -----------
-        start_tenors : array-like
-            Start tenors in years
-        end_tenors : array-like
-            End tenors in years
-        
-        Returns:
-        --------
-        numpy.array: Forward rates (as decimals)
-        """
         if self.curve is None:
             raise ValueError("Curve not bootstrapped yet. Call bootstrap_curve() first.")
-        
         forward_rates = []
         for t_start, t_end in zip(start_tenors, end_tenors):
             try:
                 date_start = self.eval_date + ql.Period(int(t_start * 365), ql.Days)
-                date_end = self.eval_date + ql.Period(int(t_end * 365), ql.Days)
-                
-                forward_rate = self.curve.forwardRate(
-                    date_start,
-                    date_end,
-                    ql.Actual360(),
-                    ql.Continuous
-                ).rate()
-                
-                forward_rates.append(forward_rate)
+                date_end   = self.eval_date + ql.Period(int(t_end   * 365), ql.Days)
+                forward_rates.append(
+                    self.curve.forwardRate(date_start, date_end, ql.Actual360(), ql.Continuous).rate()
+                )
             except:
                 forward_rates.append(np.nan)
-        
         return np.array(forward_rates)
     
     def get_curve_summary(self, sample_tenors=None):
-        """
-        Get summary of curve with zero rates and discount factors
-        
-        Parameters:
-        -----------
-        sample_tenors : array-like, optional
-            Tenors to sample. Defaults to standard tenors.
-        
-        Returns:
-        --------
-        pandas.DataFrame: Curve summary
-        """
         if self.curve is None:
             raise ValueError("Curve not bootstrapped yet. Call bootstrap_curve() first.")
-        
         if sample_tenors is None:
             sample_tenors = [0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20, 30]
-        
-        zero_rates = self.get_zero_rates(sample_tenors)
+        zero_rates       = self.get_zero_rates(sample_tenors)
         discount_factors = self.get_discount_factors(sample_tenors)
-        
         summary_data = []
-        for tenor, zero_rate, df in zip(sample_tenors, zero_rates, discount_factors):
-            if not np.isnan(zero_rate):
+        for tenor, zr, df in zip(sample_tenors, zero_rates, discount_factors):
+            if not np.isnan(zr):
                 summary_data.append({
                     'Tenor (Years)': tenor,
-                    'Zero Rate (%)': zero_rate * 100,
+                    'Zero Rate (%)': zr * 100,
                     'Discount Factor': df
                 })
-        
         return pd.DataFrame(summary_data)
     
     def get_curve_handle(self):
-        """
-        Get QuantLib curve handle for use in other instruments
-        
-        Returns:
-        --------
-        QuantLib.YieldTermStructureHandle
-        """
         if self.curve is None:
             raise ValueError("Curve not bootstrapped yet. Call bootstrap_curve() first.")
-        
         return ql.YieldTermStructureHandle(self.curve)
 
 
 def bootstrap_sofr_curve(eval_date):
-    """
-    Convenience function to bootstrap USD SOFR curve from market data
-    
-    Parameters:
-    -----------
-    eval_date : QuantLib.Date
-        Evaluation date
-    
-    Returns:
-    --------
-    YieldCurveBuilder: Bootstrapped SOFR curve
-    """
     from MarketData import get_sofr_deposit_data, get_sofr_futures_data, get_sofr_swaps_data
-    
     builder = YieldCurveBuilder(eval_date, currency='USD')
-    
-    deposit_data = get_sofr_deposit_data()
-    futures_data = get_sofr_futures_data()
-    swaps_data = get_sofr_swaps_data()
-    
-    builder.bootstrap_curve(deposit_data, futures_data, swaps_data)
-    
+    builder.bootstrap_curve(
+        get_sofr_deposit_data(),
+        get_sofr_futures_data(),
+        get_sofr_swaps_data()
+    )
     return builder
 
 
 def bootstrap_estr_curve(eval_date):
-    """
-    Convenience function to bootstrap EUR ESTR curve from market data
-    
-    Parameters:
-    -----------
-    eval_date : QuantLib.Date
-        Evaluation date
-    
-    Returns:
-    --------
-    YieldCurveBuilder: Bootstrapped ESTR curve
-    """
     from MarketData import get_estr_deposit_data, get_estr_futures_data, get_estr_swaps_data
-    
     builder = YieldCurveBuilder(eval_date, currency='EUR')
-    
-    deposit_data = get_estr_deposit_data()
-    futures_data = get_estr_futures_data()
-    swaps_data = get_estr_swaps_data()
-    
-    builder.bootstrap_curve(deposit_data, futures_data, swaps_data)
-    
+    builder.bootstrap_curve(
+        get_estr_deposit_data(),
+        get_estr_futures_data(),
+        get_estr_swaps_data()
+    )
     return builder
