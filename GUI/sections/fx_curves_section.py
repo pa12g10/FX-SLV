@@ -8,7 +8,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from MarketData import (
+from MarketData.market_data import (
     get_eval_date,
     get_sofr_deposit_data,
     get_sofr_futures_data,
