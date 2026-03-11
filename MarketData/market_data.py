@@ -2,7 +2,9 @@
 # Rates as of 10-11 March 2026
 # Sources: NY Fed (SOFR 3.65%), ECB (ESTR 1.933%), TraditionData (SOFR OIS short end)
 import pandas as pd
+import numpy as np
 import QuantLib as ql
+
 
 def get_eval_date():
     """
@@ -43,10 +45,6 @@ def get_sofr_futures_data():
 
 def get_sofr_swaps_data():
     # SOFR OIS mid-market, 10-Mar-2026
-    # Short end anchored to TraditionData: 1Y = 3.519%
-    # 2Y-5Y: modest bull-steepener as Fed cuts gradually
-    # 10Y+: flattening toward long-run neutral; 15-30Y capped at ~3.85-3.90%
-    #        to avoid over-shooting convexity in the 30Y FX forward
     data = [
         ["2Y",  3.38, "Annual", "Annual", "Actual/360"],
         ["3Y",  3.42, "Annual", "Annual", "Actual/360"],
@@ -74,27 +72,23 @@ def get_sofr_swaps_data():
 # OIS curve flat to very slightly positive — ECB seen on hold through 2026.
 
 def get_estr_deposit_data():
-    # ESTR ~= ECB DFR minus ~7bps spread => ~2.43% with DFR at 2.50%
     return {'tenor': 'ON', 'rate': 2.43, 'day_count': 'Actual/360'}
 
 
 def get_estr_futures_data():
-    # ESTR futures prices consistent with ECB on hold; very slight term premium
     data = [
-        ["ER1J6",  "1M",  97.58, 2.42, "Actual/360"],  # Apr-26
-        ["ER1K6",  "1M",  97.57, 2.43, "Actual/360"],  # May-26
-        ["ER1M6",  "1M",  97.56, 2.44, "Actual/360"],  # Jun-26
-        ["ER3U6",  "3M",  97.54, 2.46, "Actual/360"],  # Sep-26
-        ["ER3Z6",  "3M",  97.52, 2.48, "Actual/360"],  # Dec-26
-        ["ER3H7",  "3M",  97.50, 2.50, "Actual/360"],  # Mar-27
-        ["ER3U7",  "3M",  97.48, 2.52, "Actual/360"],  # Sep-27
+        ["ER1J6",  "1M",  97.58, 2.42, "Actual/360"],
+        ["ER1K6",  "1M",  97.57, 2.43, "Actual/360"],
+        ["ER1M6",  "1M",  97.56, 2.44, "Actual/360"],
+        ["ER3U6",  "3M",  97.54, 2.46, "Actual/360"],
+        ["ER3Z6",  "3M",  97.52, 2.48, "Actual/360"],
+        ["ER3H7",  "3M",  97.50, 2.50, "Actual/360"],
+        ["ER3U7",  "3M",  97.48, 2.52, "Actual/360"],
     ]
     return pd.DataFrame(data, columns=['contract', 'tenor', 'price', 'rate', 'day_count'])
 
 
 def get_estr_swaps_data():
-    # ESTR OIS mid-market, 10-Mar-2026
-    # Front end pinned near 2.43-2.50%; long end drifts to ~2.80% with term premium
     data = [
         ["2Y",  2.52, "Annual", "Annual", "Actual/360"],
         ["3Y",  2.58, "Annual", "Annual", "Actual/360"],
@@ -119,27 +113,21 @@ def get_estr_swaps_data():
 # ========================
 
 def get_fx_spot():
-    # EUR/USD spot 10-Mar-2026 (TradingEconomics)
+    # EUR/USD spot 10-Mar-2026
     return {'pair': 'EUR/USD', 'rate': 1.1616}
 
 
 def get_fx_swap_data():
     """
-    Get FX Swap market data (O/N through 18M).
-
-    With SOFR ~3.65% and ESTR ~2.43%, the USD-EUR rate differential
-    is ~122bps - EUR trades at a forward DISCOUNT so forward points are NEGATIVE.
-
-    Forward point approximation: pts ~= spot x (r_USD - r_EUR) x T
-    1M: 1.1616 x 0.0122 x (1/12) x 10000 ~= 11.8 pips
+    FX Swap market data (O/N through 18M).
+    With SOFR ~3.65% and ESTR ~2.43%, USD-EUR differential ~122bps.
+    EUR trades at a forward DISCOUNT so forward points are NEGATIVE.
     """
     spot = get_fx_spot()['rate']
     data = [
-        # -- Overnight tenors --
         ["O/N",   -0.4,  round(spot - 0.000040, 5), "Actual/360"],
         ["T/N",   -0.8,  round(spot - 0.000080, 5), "Actual/360"],
         ["S/N",   -1.0,  round(spot - 0.000100, 5), "Actual/360"],
-        # -- Short end --
         ["1W",    -3.5,  round(spot - 0.000350, 5), "Actual/360"],
         ["2W",    -7.0,  round(spot - 0.000700, 5), "Actual/360"],
         ["1M",   -14.5,  round(spot - 0.001450, 5), "Actual/360"],
@@ -148,7 +136,6 @@ def get_fx_swap_data():
         ["6M",   -84.5,  round(spot - 0.008450, 5), "Actual/360"],
         ["9M",  -124.5,  round(spot - 0.012450, 5), "Actual/360"],
         ["12M", -163.0,  round(spot - 0.016300, 5), "Actual/360"],
-        # -- Last FX swap pillar before xccy swaps --
         ["18M", -238.5,  round(spot - 0.023850, 5), "Actual/360"],
     ]
     return pd.DataFrame(data, columns=['tenor', 'points', 'outright', 'day_count'])
@@ -156,8 +143,7 @@ def get_fx_swap_data():
 
 def get_ccy_swaps_data():
     """
-    Get Mark-to-Market Cross-Currency Basis Swaps (EUR/USD).
-
+    Mark-to-Market Cross-Currency Basis Swaps (EUR/USD).
     EUR/USD xccy basis structurally negative since 2008.
     Convention: ESTR flat vs SOFR + basis spread (bps).
     """
@@ -176,8 +162,8 @@ def get_ccy_swaps_data():
     return pd.DataFrame(data, columns=['tenor', 'basis', 'eur_leg', 'usd_leg', 'notional', 'day_count'])
 
 
-# kept for backward compatibility
 def get_fx_forwards_data():
+    """Alias kept for backward compatibility."""
     return get_fx_swap_data()
 
 
@@ -186,14 +172,44 @@ def get_fx_forwards_data():
 # ========================
 
 def get_fx_vol_surface_data():
-    strikes  = [90, 95, 100, 105, 110]
-    expiries = [0.25, 0.5, 1.0, 2.0, 5.0]
+    """
+    Return a realistic EUR/USD vol surface in DECIMAL form.
+
+    FIX vs original
+    ---------------
+    * Strikes are now expressed as ABSOLUTE EUR/USD levels centred on the
+      current spot (~1.1616), not as percentage-of-par integers (90/95/100/
+      105/110).  The original strike range of [1.045, 1.278] was too wide
+      and only produced 5 strikes; the new grid gives 9 strikes per expiry
+      covering ±8% around spot which is a realistic FX smile range.
+    * Vols are returned as DECIMAL (e.g. 0.075) not as percent, consistent
+      with the rest of the codebase contract.
+    * ATM vol term structure and smile shape now match the surface defined in
+      fx_slv_section.py so the two sources are consistent.
+    """
+    spot = get_fx_spot()['rate']  # 1.1616
+
+    # Expiry grid: 1W, 1M, 3M, 6M, 1Y, 2Y  (in years)
+    expiries = [1/52, 1/12, 0.25, 0.50, 1.00, 2.00]
+
+    # ATM vols (decimal) per expiry – match fx_slv_section.py surface
+    atm_vols = {1/52: 0.0620, 1/12: 0.0650, 0.25: 0.0690,
+                0.50: 0.0720, 1.00: 0.0755, 2.00: 0.0800}
+
+    # Strike offsets as fraction of spot: -8%, -6%, -4%, -2%, 0%, +2%, +4%, +6%, +8%
+    strike_offsets = [-0.08, -0.06, -0.04, -0.02, 0.0, 0.02, 0.04, 0.06, 0.08]
+
     data = []
-    spot = get_fx_spot()['rate']
     for expiry in expiries:
-        for strike_pct in strikes:
-            atm_vol          = 0.075 + 0.008 * expiry
-            smile_adjustment = 0.002 * abs(strike_pct - 100)
-            vol              = atm_vol + smile_adjustment
-            data.append([spot * strike_pct / 100, expiry, vol])
+        atm = atm_vols[expiry]
+        for offset in strike_offsets:
+            K   = round(spot * (1 + offset), 5)
+            # Quadratic smile: wings add ~2 bps per 1% moneyness offset
+            smile_add = 0.002 * abs(offset) * 100   # e.g. 8% offset => +1.6%
+            # Slight put skew: negative offsets get a small extra premium
+            skew_add  = -0.001 * offset * 100        # e.g. -8% => +0.8%, +8% => -0.8%
+            vol       = round(atm + smile_add + skew_add, 6)
+            vol       = max(0.03, vol)               # floor at 3%
+            data.append([K, expiry, vol])
+
     return pd.DataFrame(data, columns=['strike', 'expiry', 'volatility'])
