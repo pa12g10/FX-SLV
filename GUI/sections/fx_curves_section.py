@@ -34,6 +34,13 @@ AXIS_STYLE = dict(
     tickcolor='black',
 )
 
+# Colour map matching the screenshot legend
+_INST_COLOURS = {
+    'Deposit': '#1f3c88',   # dark navy
+    'Futures': '#aec7e8',   # light blue
+    'Swaps':   '#8b0000',   # dark red
+}
+
 
 def _rate_chart(df, x_col, y_col, name, color, title, x_title, y_title):
     """Helper: simple scatter+line chart."""
@@ -48,6 +55,65 @@ def _rate_chart(df, x_col, y_col, name, color, title, x_title, y_title):
         yaxis=dict(title_text=y_title, **AXIS_STYLE),
     )
     return fig
+
+
+def _calibration_error_chart(cal_df, curve_label):
+    """
+    Build a Plotly bar chart of Model Rate - Market Rate (in bps),
+    coloured by instrument type (Deposit / Futures / Swaps).
+    Annotates each bar with its value and adds a zero-error reference line.
+    """
+    # One trace per instrument type so the legend matches the screenshot
+    fig = go.Figure()
+
+    for inst_type, colour in _INST_COLOURS.items():
+        mask = cal_df['instrument_type'] == inst_type
+        sub  = cal_df[mask]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            x=sub['instrument'],
+            y=sub['error_bps'],
+            name=inst_type,
+            marker_color=colour,
+            text=[f"{v:.2e}" for v in sub['error_bps']],
+            textposition='outside',
+            textfont=dict(size=9),
+        ))
+
+    # Zero-error reference line
+    fig.add_hline(
+        y=0,
+        line_dash='solid',
+        line_color='black',
+        line_width=1,
+        annotation_text='Zero Error',
+        annotation_position='right',
+        annotation_font=dict(size=10),
+    )
+
+    fig.update_layout(
+        title=f'Calibration Errors: Model Rate - Market Rate  ({curve_label})',
+        height=480,
+        barmode='group',
+        hovermode='x unified',
+        legend=dict(orientation='v', x=1.01, y=1),
+        xaxis=dict(
+            title_text='Instrument',
+            type='category',
+            tickangle=-35,
+            **AXIS_STYLE,
+        ),
+        yaxis=dict(title_text='Pricing Error (bps)', **AXIS_STYLE),
+        margin=dict(t=60, b=120),
+    )
+    return fig
+
+
+def _quality_metrics(cal_df):
+    """Return (max_abs, mean, rmse) in bps."""
+    errs = cal_df['error_bps'].values
+    return np.max(np.abs(errs)), np.mean(errs), np.sqrt(np.mean(errs ** 2))
 
 
 def render_fx_curves_section():
@@ -257,8 +323,9 @@ def render_fx_curves_section():
         tenors = np.linspace(0.25, 30, 120)
         forward_curve = fx_curves.get_forward_curve(tenors)
 
-        fwd_tab1, fwd_tab2, fwd_tab3, fwd_tab4 = st.tabs([
-            "Zero Rates", "Discount Factors", "Forward FX Curve", "CCY Basis"
+        fwd_tab1, fwd_tab2, fwd_tab3, fwd_tab4, fwd_tab5 = st.tabs([
+            "Zero Rates", "Discount Factors", "Forward Rates", "CCY Basis",
+            "\u26a0\ufe0f Calibration Errors",
         ])
 
         with fwd_tab1:
@@ -317,7 +384,6 @@ def render_fx_curves_section():
             st.plotly_chart(fig_fwd, use_container_width=True)
 
         with fwd_tab4:
-            # Basis spread only - interpolated across the full tenor grid
             fig_basis_fwd = go.Figure()
             fig_basis_fwd.add_trace(go.Scatter(
                 x=forward_curve['Tenor (Years)'], y=forward_curve['Basis (bps)'],
@@ -333,5 +399,74 @@ def render_fx_curves_section():
                 yaxis=dict(title_text='Basis Spread (bps)', **AXIS_STYLE),
             )
             st.plotly_chart(fig_basis_fwd, use_container_width=True)
+
+        # ============================================================
+        # TAB 5  -  CALIBRATION ERRORS
+        # ============================================================
+        with fwd_tab5:
+            st.markdown("### Calibration Errors: Model Rate vs Market Rate")
+            st.write("""
+            Each bar shows **Model Rate − Market Rate** (in basis points) for every
+            bootstrapping instrument.  A well-calibrated curve sits on the zero line;
+            departures reflect numerical solver tolerance (typically < 1e-8 bps).
+            """)
+
+            usd_builder = fx_curves.usd_curve_builder
+            eur_builder = fx_curves.eur_curve_builder
+
+            cal_col1, cal_col2 = st.columns(2)
+
+            # --- USD SOFR errors ---
+            with cal_col1:
+                st.markdown("#### USD SOFR")
+                try:
+                    usd_cal = usd_builder.get_calibration_errors()
+                    st.plotly_chart(
+                        _calibration_error_chart(usd_cal, 'USD SOFR'),
+                        use_container_width=True,
+                    )
+                    max_abs, mean_err, rmse = _quality_metrics(usd_cal)
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric('Max Abs Error', f"{max_abs:.2e} bps")
+                    m2.metric('Mean Error',    f"{mean_err:.2e} bps")
+                    m3.metric('RMSE',          f"{rmse:.2e} bps")
+                    with st.expander("Raw calibration data", expanded=False):
+                        st.dataframe(
+                            usd_cal.style.format({
+                                'market_rate': '{:.6f}',
+                                'model_rate':  '{:.6f}',
+                                'error_bps':   '{:.2e}',
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
+                except Exception as exc:
+                    st.warning(f"Could not compute USD calibration errors: {exc}")
+
+            # --- EUR ESTR errors ---
+            with cal_col2:
+                st.markdown("#### EUR ESTR")
+                try:
+                    eur_cal = eur_builder.get_calibration_errors()
+                    st.plotly_chart(
+                        _calibration_error_chart(eur_cal, 'EUR ESTR'),
+                        use_container_width=True,
+                    )
+                    max_abs, mean_err, rmse = _quality_metrics(eur_cal)
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric('Max Abs Error', f"{max_abs:.2e} bps")
+                    m2.metric('Mean Error',    f"{mean_err:.2e} bps")
+                    m3.metric('RMSE',          f"{rmse:.2e} bps")
+                    with st.expander("Raw calibration data", expanded=False):
+                        st.dataframe(
+                            eur_cal.style.format({
+                                'market_rate': '{:.6f}',
+                                'model_rate':  '{:.6f}',
+                                'error_bps':   '{:.2e}',
+                            }),
+                            use_container_width=True, hide_index=True,
+                        )
+                except Exception as exc:
+                    st.warning(f"Could not compute EUR calibration errors: {exc}")
+
     else:
         st.info("Click 'Bootstrap All Curves & Generate Forwards' above to see results.")
