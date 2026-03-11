@@ -241,8 +241,12 @@ class FXStochasticLocalVol:
         Compute Heston implied vols for all calibration instruments.
 
         Returns array length N in DECIMAL form.
-        NaN means IV inversion failed for that instrument — every failure is
-        logged to stdout with reason. No value is silently substituted.
+        NaN means IV inversion failed — every failure is logged with reason.
+        No value is silently substituted.
+
+        Note: impliedVolatility() is called with positional arguments only.
+        The QuantLib Python binding does not accept keyword arguments for this method.
+        Signature: impliedVolatility(price, process, accuracy, maxEvals, minVol, maxVol)
         """
         p = self._clip(params)
         v0, kappa, theta, sigma, rho = float(p[0]), float(p[1]), float(p[2]), float(p[3]), float(p[4])
@@ -282,8 +286,8 @@ class FXStochasticLocalVol:
                     print(f"  [IV] FAIL i={i} K={K:.5f} T={T:.4f}: Heston price={price:.6f} <= 0")
                     continue
 
-                rd_df = self.domestic_curve.discount(T)
-                rf_df = self.foreign_curve.discount(T)
+                rd_df   = self.domestic_curve.discount(T)
+                rf_df   = self.foreign_curve.discount(T)
                 rd_rate = self._rate_from_discount(rd_df, T, f"domestic i={i}")
                 rf_rate = self._rate_from_discount(rf_df, T, f"foreign i={i}")
 
@@ -299,11 +303,8 @@ class FXStochasticLocalVol:
                 option2 = ql.VanillaOption(payoff, exercise)
                 option2.setPricingEngine(ql.AnalyticEuropeanEngine(bs_proc))
                 try:
-                    iv = option2.impliedVolatility(
-                        price, bs_proc,
-                        accuracy=1e-6, maxEvaluations=1000,
-                        minVol=0.001, maxVol=2.0
-                    )
+                    # Positional args only — QuantLib Python binding rejects keyword args
+                    iv = option2.impliedVolatility(price, bs_proc, 1e-6, 1000, 0.001, 2.0)
                     ivs[i] = iv
                 except Exception as e_iv:
                     print(f"  [IV] FAIL i={i} K={K:.5f} T={T:.4f}: impliedVolatility error: {e_iv} "
@@ -412,11 +413,11 @@ class FXStochasticLocalVol:
                 model_vol_pct = float(iv) * 100
                 vol_error_bps = (float(iv) - mkt_vol) * 10000
 
-            # Price comparison
-            model_price  = float('nan')
-            market_price = float('nan')
-            price_error  = float('nan')
+            model_price     = float('nan')
+            market_price    = float('nan')
+            price_error     = float('nan')
             price_error_pct = float('nan')
+
             try:
                 engine = ql.AnalyticHestonEngine(self.heston_model)
                 expiry_date = self.eval_date + ql.Period(max(1, int(round(T * 365))), ql.Days)
@@ -456,7 +457,8 @@ class FXStochasticLocalVol:
                     if market_price > 1e-10:
                         price_error_pct = price_error / market_price * 100
                     else:
-                        print(f"  [results] i={i} K={K:.5f} T={T:.4f}: market_price={market_price:.8f} too small for pct error")
+                        print(f"  [results] i={i} K={K:.5f} T={T:.4f}: "
+                              f"market_price={market_price:.8f} too small for pct error")
             except Exception as e:
                 print(f"  [results] i={i} K={K:.5f} T={T:.4f}: market pricing failed: {e}")
 
@@ -498,7 +500,10 @@ class FXStochasticLocalVol:
         rho   = float(p[4])
 
         if v0 <= 0 or kappa <= 0 or theta <= 0 or sigma <= 0:
-            raise ValueError(f"Invalid Heston params for simulation: v0={v0} kappa={kappa} theta={theta} sigma={sigma}")
+            raise ValueError(
+                f"Invalid Heston params for simulation: "
+                f"v0={v0} kappa={kappa} theta={theta} sigma={sigma}"
+            )
         if abs(rho) >= 1.0:
             raise ValueError(f"Invalid rho={rho} for simulation")
 
@@ -554,7 +559,6 @@ class FXStochasticLocalVol:
             option.setPricingEngine(ql.AnalyticHestonEngine(self.heston_model))
             heston_price = option.NPV()
 
-            # Find market vol from calibration data — no hardcoded fallback
             if self._cal_strikes is None:
                 raise RuntimeError("No calibration data to look up market vol for validation.")
             mask = ((np.abs(self._cal_strikes - strike) < 1e-5) &
@@ -564,8 +568,10 @@ class FXStochasticLocalVol:
                 continue
             market_vol = float(self._cal_vols[mask][0])
 
-            rd_rate = self._rate_from_discount(self.domestic_curve.discount(expiry), expiry, f"domestic K={strike}")
-            rf_rate = self._rate_from_discount(self.foreign_curve.discount(expiry),  expiry, f"foreign K={strike}")
+            rd_rate = self._rate_from_discount(
+                self.domestic_curve.discount(expiry), expiry, f"domestic K={strike}")
+            rf_rate = self._rate_from_discount(
+                self.foreign_curve.discount(expiry),  expiry, f"foreign K={strike}")
 
             bs_proc = ql.BlackScholesMertonProcess(
                 self.spot_handle,
