@@ -6,19 +6,17 @@
 #
 # 2. CCY basis curve = NEW EUR discount curve embedding the xccy basis:
 #    Short end (1W-18M) : ql.FxSwapRateHelper
+#                         is_fx_base_currency_collateral_currency=True
+#                         USD is collateral; negative fwd pts => df_eur_basis < df_eur
 #    Long end  (2Y-30Y) : ql.MtMCrossCurrencyBasisSwapRateHelper
-#    -> self.eur_basis_curve  (ql.PiecewiseLogLinearDiscount)
+#                         basisOnBase=False, baseResets=True, baseIsCollateral=True
+#                         negative basis => EUR basis zero rates > flat ESTR
+#    Both segments consistently produce df_eur_basis < df_eur
+#    => adjusted_forward < standard_forward (correct for negative EUR/USD basis)
 #
-# 3. Calibration errors via helper.impliedQuote() - helper.quote().value()
-#
-# Market data convention: 'ESTR flat vs SOFR + basis'
-#   basisOnBase=True, baseResets=True, baseIsCollateral=True
-#   Negative basis on USD leg => EUR basis zero rates > flat ESTR
-#   => df_eur_basis < df_eur => adjusted_forward < standard_forward  (correct)
-#
-# Basis spread display: (zr_eur_basis - zr_eur_flat) * 10000
-#   gives the actual spread embedded in the basis curve vs flat ESTR
-#   -> should read approx -20 to -29 bps in the long end
+# 3. Basis spread display: (zr_eur_basis - zr_eur_flat) * 10000
+#    => should read ~-20 to -29 bps in the long end
+#    => short end driven by FX swap implied basis (~-120 bps at 1Y)
 
 import QuantLib as ql
 import numpy as np
@@ -74,9 +72,7 @@ class FXCurves:
 
         self.usd_curve_builder = bootstrap_sofr_curve(self.eval_date)
         self.usd_curve         = self.usd_curve_builder.curve
-
         print("\n" + "-"*60)
-
         self.eur_curve_builder = bootstrap_estr_curve(self.eval_date)
         self.eur_curve         = self.eur_curve_builder.curve
 
@@ -94,7 +90,14 @@ class FXCurves:
     def bootstrap_basis_curve(self):
         """
         Bootstrap the EUR basis discount curve.
-        Output: self.eur_basis_curve  (ql.PiecewiseLogLinearDiscount)
+
+        FX Swap helpers: is_fx_base_currency_collateral_currency=True
+            USD is collateral; QL bootstraps EUR dfs from forward points.
+            Negative fwd pts => EUR basis dfs < flat ESTR dfs.
+
+        CCY Swap helpers: basisOnBase=False, baseResets=True
+            Negative basis on EUR leg => EUR basis zero rates > flat ESTR
+            => same direction as FX swap region: df_eur_basis < df_eur.
         """
         if self.usd_curve is None or self.eur_curve is None:
             raise ValueError("Call bootstrap_domestic_curves() first.")
@@ -121,18 +124,19 @@ class FXCurves:
         used_pillars      = set()
 
         # ---- FX SWAP helpers (short end: 1W - 18M) ----
-        print("\nAdding FX Swap helpers (ql.FxSwapRateHelper):")
+        print("\nAdding FX Swap helpers (ql.FxSwapRateHelper, USD collateral):")
         for _, row in self.fx_forwards_data.iterrows():
             tenor = row['tenor']
             if tenor in _SKIP:
                 continue
-            fwd_points = row['outright'] - self.spot_fx
+            fwd_points = row['outright'] - self.spot_fx   # negative for EUR/USD
             try:
                 helper = self.fx_fwd_pricer.create_ql_helper(
                     tenor            = tenor,
                     forward_points   = fwd_points,
                     usd_curve_handle = self._usd_handle,
                     eur_curve_handle = self._eur_handle,
+                    is_fx_base_currency_collateral_currency = True,  # USD is collateral
                 )
                 pillar = helper.latestDate()
                 if pillar not in used_pillars:
@@ -169,7 +173,7 @@ class FXCurves:
                 else:
                     print(f"  {tenor:<6}  SKIP (duplicate pillar {pillar})")
             except Exception as exc:
-                print(f"  {tenor:<6}  ERROR building CCY Swap helper: {exc}")
+                print(f"  {tenor:<6}  ERROR: {exc}")
                 self._helper_meta.append({'label': f"CCY Swap {tenor}",
                                           'instrument_type': 'CCY Swaps',
                                           'build_error': str(exc)})
@@ -188,9 +192,10 @@ class FXCurves:
                 df_flat  = self.eur_curve.discount(t)
                 zr_basis = self.eur_basis_curve.zeroRate(t, ql.Continuous).rate() * 100
                 zr_flat  = self.eur_curve.zeroRate(t, ql.Continuous).rate() * 100
-                spread   = (zr_basis - zr_flat) * 100  # bps
+                spread   = (zr_basis - zr_flat) * 100
+                chk      = '\u2705' if df_basis < df_flat else '\u274c'
                 print(f"   {t:>4}Y: df_basis={df_basis:.6f}  df_flat={df_flat:.6f}  "
-                      f"zr_basis={zr_basis:.4f}%  spread={spread:+.1f}bps")
+                      f"spread={spread:+.1f}bps  {chk}")
             except Exception:
                 pass
 
@@ -203,16 +208,6 @@ class FXCurves:
     # ------------------------------------------------------------------
 
     def get_basis_calibration_errors(self):
-        """
-        Return calibration errors for all CCY basis instruments.
-        Failed helpers are reported with NaN and a note.
-
-        Returns
-        -------
-        pandas.DataFrame
-            Columns: instrument, instrument_type, market_rate, model_rate,
-                     error_bps, note
-        """
         if self.eur_basis_curve is None:
             raise ValueError("Basis curve not bootstrapped yet.")
 
@@ -227,32 +222,25 @@ class FXCurves:
                              'error_bps':       float('nan'),
                              'note':            f"build error: {meta['build_error']}"})
                 continue
-
             helper = self._helpers[helper_idx]
             helper_idx += 1
-            inst   = meta['instrument_type']
-
             try:
-                mkt   = helper.quote().value()
-                model = helper.impliedQuote()
-                # Both FX Swaps and CCY Swaps: multiply by 10_000 for bps/pips display
-                error_bps   = (model - mkt) * 10_000
-                market_disp = mkt   * 10_000
-                model_disp  = model * 10_000
+                mkt        = helper.quote().value()
+                model      = helper.impliedQuote()
+                error_bps  = (model - mkt) * 10_000
                 rows.append({'instrument':      meta['label'],
-                             'instrument_type': inst,
-                             'market_rate':     market_disp,
-                             'model_rate':      model_disp,
+                             'instrument_type': meta['instrument_type'],
+                             'market_rate':     mkt   * 10_000,
+                             'model_rate':      model * 10_000,
                              'error_bps':       error_bps,
                              'note':            ''})
             except Exception as exc:
                 rows.append({'instrument':      meta['label'],
-                             'instrument_type': inst,
+                             'instrument_type': meta['instrument_type'],
                              'market_rate':     float('nan'),
                              'model_rate':      float('nan'),
                              'error_bps':       float('nan'),
                              'note':            f"impliedQuote error: {exc}"})
-
         return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
@@ -261,14 +249,10 @@ class FXCurves:
 
     def get_basis_adjusted_forward(self, tenor_years):
         """
-        Basis-adjusted FX forward: F = spot * df_eur_basis / df_usd
-
+        F_adj = spot * df_eur_basis / df_usd
         basis_spread_bps = (zr_eur_basis - zr_eur_flat) * 10_000
-            -> the spread embedded in the basis curve vs flat ESTR
-            -> expected to be negative (-20 to -29 bps) in the long end
-
-        adjusted_forward < standard_forward because df_eur_basis < df_eur
-        (basis curve zero rates are higher than flat ESTR).
+            => negative (~-20 to -120 bps) since zr_basis > zr_flat
+               when df_basis < df_flat.
         """
         if self.eur_basis_curve is None:
             raise ValueError("Basis curve not bootstrapped yet.")
@@ -280,8 +264,6 @@ class FXCurves:
         standard_forward = self.spot_fx * df_eur       / df_usd
         adjusted_forward = self.spot_fx * df_eur_basis / df_usd
 
-        # Basis spread = how much the EUR basis curve zero rate differs from flat ESTR
-        # (NOT the USD-EUR rate spread)
         zr_eur_basis = self.eur_basis_curve.zeroRate(tenor_years, ql.Continuous).rate()
         zr_eur_flat  = self.eur_curve.zeroRate(tenor_years, ql.Continuous).rate()
         basis_bps    = (zr_eur_basis - zr_eur_flat) * 10_000
@@ -291,7 +273,7 @@ class FXCurves:
             'spot':               self.spot_fx,
             'standard_forward':   standard_forward,
             'adjusted_forward':   adjusted_forward,
-            'basis_spread_bps':   basis_bps,           # ~-20 to -29 bps expected
+            'basis_spread_bps':   basis_bps,
             'basis_impact_pips':  (adjusted_forward - standard_forward) * 10_000,
             'df_usd':             df_usd,
             'df_eur':             df_eur,

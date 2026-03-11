@@ -9,6 +9,14 @@ class FXForwardPricer:
 
     create_ql_helper() produces a ql.FxSwapRateHelper that feeds directly
     into ql.PiecewiseLogLinearDiscount for CCY basis curve bootstrapping.
+
+    EUR/USD convention for FxSwapRateHelper
+    ----------------------------------------
+    is_fx_base_currency_collateral_currency = True
+        USD is the FX base currency of EUR/USD AND the collateral currency.
+        QL treats usd_curve_handle as the known curve and bootstraps EUR.
+        Negative forward points (EUR at discount) => df_eur_basis < df_eur
+        => adjusted_forward < standard_forward (correct).
     """
 
     def __init__(self, eval_date, spot_fx):
@@ -24,39 +32,26 @@ class FXForwardPricer:
                          usd_curve_handle, eur_curve_handle,
                          spot_date=None, calendar=None,
                          bdc=ql.Following, end_of_month=False,
-                         is_fx_base_currency_collateral_currency=False):
+                         is_fx_base_currency_collateral_currency=True):
         """
         Create a ql.FxSwapRateHelper for bootstrapping the CCY basis curve.
-
-        QuantLib convention for FxSwapRateHelper
-        -----------------------------------------
-        The helper takes the *forward points* (F - S), the spot quote,
-        the tenor, and the two collateral/discount curves.  It solves for
-        the discount curve that makes the FX swap reprice exactly.
 
         Parameters
         ----------
         tenor : str
             e.g. '1W', '1M', '6M', '18M'
         forward_points : float
-            Market forward points (outright - spot), e.g. -0.014500 for 1M
+            Market forward points (outright - spot), e.g. -0.014500 for 1M.
+            Negative for EUR/USD (USD rates > EUR rates => EUR at discount).
         usd_curve_handle : ql.YieldTermStructureHandle
-            USD SOFR discount curve (domestic / collateral)
+            USD SOFR discount curve — the known/collateral curve.
         eur_curve_handle : ql.YieldTermStructureHandle
-            EUR ESTR discount curve (foreign)
-        spot_date : ql.Date, optional
-            Spot date (T+2 by default)
-        calendar : ql.Calendar, optional
-            Joint USD+EUR calendar (defaults to TARGET + UnitedStates)
-        bdc : ql.BusinessDayConvention
-        end_of_month : bool
+            EUR ESTR discount curve (not used directly by FxSwapRateHelper;
+            kept for consistent call-site API).
         is_fx_base_currency_collateral_currency : bool
-            True  -> USD is collateral (standard for USD-collateralised EUR/USD)
-            False -> EUR is collateral
-
-        Returns
-        -------
-        ql.FxSwapRateHelper
+            True  -> USD is collateral (standard EUR/USD, USD-collateralised).
+                     QL bootstraps EUR discount factors from forward points.
+            False -> EUR is collateral (wrong for EUR/USD; do not use).
         """
         if calendar is None:
             calendar = ql.JointCalendar(
@@ -64,14 +59,12 @@ class FXForwardPricer:
                 ql.UnitedStates(ql.UnitedStates.FederalReserve)
             )
 
-        # Spot date: T+2 good business days
         if spot_date is None:
             spot_date = calendar.advance(
                 self.eval_date, ql.Period(2, ql.Days), bdc
             )
 
-        period = self._parse_tenor(tenor)
-
+        period     = self._parse_tenor(tenor)
         spot_quote = ql.QuoteHandle(ql.SimpleQuote(self.spot_fx))
         fwd_quote  = ql.QuoteHandle(ql.SimpleQuote(forward_points))
 
@@ -79,12 +72,12 @@ class FXForwardPricer:
             fwd_quote,
             spot_quote,
             period,
-            2,                  # fixing days
+            2,                                          # fixing days
             calendar,
             bdc,
             end_of_month,
-            is_fx_base_currency_collateral_currency,
-            usd_curve_handle,
+            is_fx_base_currency_collateral_currency,    # True = USD is collateral
+            usd_curve_handle,                           # known collateral curve
         )
         return helper
 
@@ -99,13 +92,11 @@ class FXForwardPricer:
         """
         period        = self._parse_tenor(tenor)
         maturity_date = self.eval_date + period
-
-        dc = ql.Actual360() if day_count == 'Actual/360' else ql.Actual365Fixed()
+        dc            = ql.Actual360() if day_count == 'Actual/360' else ql.Actual365Fixed()
         time_to_mat   = dc.yearFraction(self.eval_date, maturity_date)
 
         df_domestic = domestic_curve.discount(maturity_date)
         df_foreign  = foreign_curve.discount(maturity_date)
-
         r_domestic  = domestic_curve.zeroRate(time_to_mat, ql.Continuous).rate()
         r_foreign   = foreign_curve.zeroRate(time_to_mat, ql.Continuous).rate()
 
@@ -137,10 +128,9 @@ class FXForwardPricer:
         fair_forward  = fwd['forward_rate']
         maturity_date = fwd['maturity_date']
         df_domestic   = domestic_curve.discount(maturity_date)
-
-        sign             = 1 if is_buy else -1
-        payoff_maturity  = sign * notional * (fair_forward - strike)
-        npv              = payoff_maturity * df_domestic
+        sign          = 1 if is_buy else -1
+        payoff        = sign * notional * (fair_forward - strike)
+        npv           = payoff * df_domestic
 
         return {
             'notional':               notional,
@@ -149,7 +139,7 @@ class FXForwardPricer:
             'forward_points_strike':  (strike       - self.spot_fx) * 10_000,
             'forward_points_fair':    fwd['forward_points'],
             'points_diff':            (fair_forward - strike)       * 10_000,
-            'payoff_at_maturity':     payoff_maturity,
+            'payoff_at_maturity':     payoff,
             'npv':                    npv,
             'df_domestic':            df_domestic,
             'is_buy':                 is_buy,
