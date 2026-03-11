@@ -36,7 +36,7 @@ def render_double_barrier_section():
     
     fx_curves = st.session_state.fx_curves
     fx_slv = st.session_state.fx_slv_model
-    spot_fx = st.session_state.spot_fx
+    spot_fx = fx_curves.spot_fx
     
     st.markdown("---")
     
