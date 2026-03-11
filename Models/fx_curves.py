@@ -6,17 +6,17 @@
 #
 # 2. CCY basis curve = NEW EUR discount curve embedding the xccy basis:
 #    Short end (1W-18M) : ql.FxSwapRateHelper
-#                         is_fx_base_currency_collateral_currency=False
-#                         EUR is treated as collateral; negative fwd pts
-#                         => df_eur_basis < df_eur_flat (correct direction)
+#                         is_fx_base_currency_collateral_currency=True
+#                         USD is collateral; negative fwd pts => df_eur_basis < df_eur
 #    Long end  (2Y-30Y) : ql.MtMCrossCurrencyBasisSwapRateHelper
 #                         basisOnBase=False, baseResets=True, baseIsCollateral=True
 #                         negative basis => EUR basis zero rates > flat ESTR
 #    Both segments consistently produce df_eur_basis < df_eur
-#    => basis_spread_bps = (zr_eur_basis - zr_eur_flat)*10000 is negative
+#    => adjusted_forward < standard_forward (correct for negative EUR/USD basis)
 #
 # 3. Basis spread display: (zr_eur_basis - zr_eur_flat) * 10000
 #    => should read ~-20 to -29 bps in the long end
+#    => short end driven by FX swap implied basis (~-120 bps at 1Y)
 
 import QuantLib as ql
 import numpy as np
@@ -91,10 +91,9 @@ class FXCurves:
         """
         Bootstrap the EUR basis discount curve.
 
-        FX Swap helpers: is_fx_base_currency_collateral_currency=False
-            With False, QL treats EUR as the currency being solved for
-            using the known USD curve and the quoted forward points.
-            Negative fwd pts (EUR discount) => df_eur_basis < df_eur_flat.
+        FX Swap helpers: is_fx_base_currency_collateral_currency=True
+            USD is collateral; QL bootstraps EUR dfs from forward points.
+            Negative fwd pts => EUR basis dfs < flat ESTR dfs.
 
         CCY Swap helpers: basisOnBase=False, baseResets=True
             Negative basis on EUR leg => EUR basis zero rates > flat ESTR
@@ -125,7 +124,7 @@ class FXCurves:
         used_pillars      = set()
 
         # ---- FX SWAP helpers (short end: 1W - 18M) ----
-        print("\nAdding FX Swap helpers (ql.FxSwapRateHelper, is_fx_base_ccy_collateral=False):")
+        print("\nAdding FX Swap helpers (ql.FxSwapRateHelper, USD collateral):")
         for _, row in self.fx_forwards_data.iterrows():
             tenor = row['tenor']
             if tenor in _SKIP:
@@ -137,7 +136,7 @@ class FXCurves:
                     forward_points   = fwd_points,
                     usd_curve_handle = self._usd_handle,
                     eur_curve_handle = self._eur_handle,
-                    is_fx_base_currency_collateral_currency = False,  # EUR bootstrapped
+                    is_fx_base_currency_collateral_currency = True,  # USD is collateral
                 )
                 pillar = helper.latestDate()
                 if pillar not in used_pillars:
@@ -252,8 +251,8 @@ class FXCurves:
         """
         F_adj = spot * df_eur_basis / df_usd
         basis_spread_bps = (zr_eur_basis - zr_eur_flat) * 10_000
-            => negative (~-20 to -29 bps) in the long end
-            => driven by FX swap implied basis in the short end
+            => negative (~-20 to -120 bps) since zr_basis > zr_flat
+               when df_basis < df_flat.
         """
         if self.eur_basis_curve is None:
             raise ValueError("Basis curve not bootstrapped yet.")
