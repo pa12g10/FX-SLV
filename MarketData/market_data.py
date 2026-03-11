@@ -17,32 +17,25 @@ def get_eval_date():
 # ========================
 # USD SOFR Curve Instruments
 # ========================
-# Fed on hold; overnight SOFR = 3.65%.
-# Term structure: slight inversion at front end as market prices 1-2 cuts in 2026,
-# then modest re-steepening. Long end (15-30Y) capped ~3.85-3.90% reflecting
-# realistic long-run neutral with moderate term premium.
 
 def get_sofr_deposit_data():
-    # SOFR fixing 10-Mar-2026: 3.65% (NY Fed)
     return {'tenor': 'ON', 'rate': 3.65, 'day_count': 'Actual/360'}
 
 
 def get_sofr_futures_data():
-    # Prices imply rates consistent with 1Y OIS at ~3.52% and gentle bull-steepening
     data = [
-        ["SR1J6",  "1M",  96.32, 3.68, "Actual/360"],  # Apr-26
-        ["SR1K6",  "1M",  96.30, 3.70, "Actual/360"],  # May-26
-        ["SR1M6",  "1M",  96.34, 3.66, "Actual/360"],  # Jun-26
-        ["SR3U6",  "3M",  96.42, 3.58, "Actual/360"],  # Sep-26 (1 cut priced)
-        ["SR3Z6",  "3M",  96.55, 3.45, "Actual/360"],  # Dec-26
-        ["SR3H7",  "3M",  96.62, 3.38, "Actual/360"],  # Mar-27
-        ["SR3U7",  "3M",  96.68, 3.32, "Actual/360"],  # Sep-27
+        ["SR1J6",  "1M",  96.32, 3.68, "Actual/360"],
+        ["SR1K6",  "1M",  96.30, 3.70, "Actual/360"],
+        ["SR1M6",  "1M",  96.34, 3.66, "Actual/360"],
+        ["SR3U6",  "3M",  96.42, 3.58, "Actual/360"],
+        ["SR3Z6",  "3M",  96.55, 3.45, "Actual/360"],
+        ["SR3H7",  "3M",  96.62, 3.38, "Actual/360"],
+        ["SR3U7",  "3M",  96.68, 3.32, "Actual/360"],
     ]
     return pd.DataFrame(data, columns=['contract', 'tenor', 'price', 'rate', 'day_count'])
 
 
 def get_sofr_swaps_data():
-    # SOFR OIS mid-market, 10-Mar-2026
     data = [
         ["2Y",  3.38, "Annual", "Annual", "Actual/360"],
         ["3Y",  3.42, "Annual", "Annual", "Actual/360"],
@@ -113,38 +106,43 @@ def get_fx_spot():
 
 def get_fx_swap_data():
     """
-    Get FX Swap market data (O/N through 2Y).
+    FX Swap outrights (O/N through 2Y), EUR/USD.
 
-    Pillars are spaced to keep the rate-of-change of forward points
-    roughly constant, preventing PiecewiseLogLinearDiscount from
-    overshooting between sparse pillars.
+    Outrights computed as: F = spot * exp((r_USD - r_EUR - basis) * T)
+    where basis transitions linearly from -20 bps (short end) to -22.5 bps (2Y),
+    matching the first CCY swap pillar exactly.
 
-    Forward points (all negative = EUR discount vs USD):
-      12M: -163.0  (rate: ~-13.6 pips/month)
-      15M: -200.5  (midpoint interpolation, ~-12.5 pips/month - smooth)
-      18M: -238.5  (rate: ~-12.7 pips/month)
-      2Y:  -312.0  (bridge to first CCY swap pillar at -22.5 bps)
+    With SOFR ~3.65% and ESTR ~2.43% (differential ~1.22%), EUR trades at
+    a forward PREMIUM (positive forward points) since USD rates > EUR rates
+    means USD is worth more in the future => EUR/USD forward > spot.
+
+    Basis (negative) slightly reduces the EUR discount factor, increasing
+    the forward above pure CIP.
+
+    Forward points (pips = (outright - spot) * 10000):
+      1M:  +14.0   3M:  +41.3   6M:  +80.7   12M: +149.1
+      15M: +175.6  18M: +202.1  2Y:  +254.8
     """
     spot = get_fx_spot()['rate']
     data = [
         # -- Overnight tenors (skipped by bootstrapper) --
-        ["O/N",   -0.4,  round(spot - 0.000040, 5), "Actual/360"],
-        ["T/N",   -0.8,  round(spot - 0.000080, 5), "Actual/360"],
-        ["S/N",   -1.0,  round(spot - 0.000100, 5), "Actual/360"],
-        # -- Short end --
-        ["1W",    -3.5,  round(spot - 0.000350, 5), "Actual/360"],
-        ["2W",    -7.0,  round(spot - 0.000700, 5), "Actual/360"],
-        ["1M",   -14.5,  round(spot - 0.001450, 5), "Actual/360"],
-        ["2M",   -28.8,  round(spot - 0.002880, 5), "Actual/360"],
-        ["3M",   -43.0,  round(spot - 0.004300, 5), "Actual/360"],
-        ["6M",   -84.5,  round(spot - 0.008450, 5), "Actual/360"],
-        ["9M",  -124.5,  round(spot - 0.012450, 5), "Actual/360"],
-        ["12M", -163.0,  round(spot - 0.016300, 5), "Actual/360"],
-        # -- 15M bridge: midpoint between 12M (-163) and 18M (-238.5) = -200.75 --
-        ["15M", -200.5,  round(spot - 0.020050, 5), "Actual/360"],
-        ["18M", -238.5,  round(spot - 0.023850, 5), "Actual/360"],
-        # -- 2Y bridge: consistent with 2Y CCY swap basis of -22.5 bps --
-        ["2Y",  -312.0,  round(spot - 0.031200, 5), "Actual/360"],
+        ["O/N",  +0.4,  round(spot + 0.000040, 5), "Actual/360"],
+        ["T/N",  +0.8,  round(spot + 0.000080, 5), "Actual/360"],
+        ["S/N",  +1.0,  round(spot + 0.000100, 5), "Actual/360"],
+        # -- Short end (basis ~ -20 bps) --
+        ["1W",   +3.3,  round(spot + 0.000330, 5), "Actual/360"],
+        ["2W",   +6.5,  round(spot + 0.000650, 5), "Actual/360"],
+        ["1M",  +14.0,  round(spot + 0.001400, 5), "Actual/360"],
+        ["2M",  +27.8,  round(spot + 0.002780, 5), "Actual/360"],
+        ["3M",  +41.3,  round(spot + 0.004130, 5), "Actual/360"],
+        ["6M",  +80.7,  round(spot + 0.008070, 5), "Actual/360"],
+        ["9M", +117.3,  round(spot + 0.011730, 5), "Actual/360"],
+        ["12M",+149.1,  round(spot + 0.014910, 5), "Actual/360"],
+        # -- Transition tenors (basis easing from -21.5 to -22.5 bps) --
+        ["15M",+175.6,  round(spot + 0.017560, 5), "Actual/360"],
+        ["18M",+202.1,  round(spot + 0.020210, 5), "Actual/360"],
+        # -- 2Y bridge: exactly consistent with 2Y CCY swap at -22.5 bps --
+        ["2Y", +254.8,  round(spot + 0.025480, 5), "Actual/360"],
     ]
     return pd.DataFrame(data, columns=['tenor', 'points', 'outright', 'day_count'])
 
