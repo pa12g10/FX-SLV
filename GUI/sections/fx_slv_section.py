@@ -10,6 +10,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from Models.fx_slv import FXStochasticLocalVol
+from MarketData.market_data import get_eval_date
 
 try:
     import QuantLib as ql
@@ -18,65 +19,20 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Helper: convert delta + spot/rates/vol/T -> strike (Garman-Kohlhagen inversion)
-#
-# Standard GK delta conventions (premium-unadjusted, spot delta):
-#   Call delta = exp(-rf*T) * N(d1)          => d1 = N^{-1}(delta_call * exp(rf*T))
-#   Put  delta = exp(-rf*T) * (N(d1) - 1)    => d1 = N^{-1}(delta_put  * exp(rf*T) + 1)
-#
-#   d1 = [ ln(S/K) + (rd - rf + 0.5*sigma^2)*T ] / (sigma*sqrt(T))
-#   => K = S * exp( (rd - rf + 0.5*sigma^2)*T - d1*sigma*sqrt(T) )
-#
-# For a 25-delta PUT  : delta_put = -0.25  => d1 = N^{-1}(0.75)  => K  > ATM  (WRONG)
-# Market convention: quote put delta as positive magnitude (0.25) with is_put flag.
-#   d1 = N^{-1}(1 - delta_abs * exp(rf*T))   for puts
-#   d1 = N^{-1}(      delta_abs * exp(rf*T))  for calls
 # ---------------------------------------------------------------------------
 def delta_to_strike(delta_abs, S, T, rd, rf, sigma, is_put=False):
-    """
-    Invert Garman-Kohlhagen spot delta to strike.
-
-    Parameters
-    ----------
-    delta_abs : float   absolute delta (e.g. 0.25 for 25-delta)
-    S         : float   spot FX rate
-    T         : float   expiry in years
-    rd        : float   domestic continuously-compounded rate
-    rf        : float   foreign  continuously-compounded rate
-    sigma     : float   implied volatility (decimal)
-    is_put    : bool    True for put deltas
-
-    Returns
-    -------
-    float : strike K
-    """
     from scipy.stats import norm
-
-    # GK spot delta (premium unadjusted)
-    #   call: delta_c = exp(-rf*T) * N(d1)  => N(d1) = delta_c * exp(rf*T)
-    #   put:  delta_p = exp(-rf*T) * (N(d1) - 1)
-    #                              => N(d1) = 1 + delta_p * exp(rf*T)
-    #                  (delta_p is NEGATIVE, so this is < 1 as expected)
     if is_put:
-        # delta_abs is the *magnitude* of the put delta (positive number)
         Nd1 = 1.0 - delta_abs * np.exp(rf * T)
     else:
         Nd1 = delta_abs * np.exp(rf * T)
-
-    # Clamp to avoid norm.ppf blowing up
     Nd1 = np.clip(Nd1, 1e-8, 1 - 1e-8)
     d1  = norm.ppf(Nd1)
-
-    # K = S * exp( (rd - rf + 0.5*sigma^2)*T - d1*sigma*sqrt(T) )
-    K = S * np.exp((rd - rf + 0.5 * sigma**2) * T - d1 * sigma * np.sqrt(T))
-    return K
+    return S * np.exp((rd - rf + 0.5 * sigma**2) * T - d1 * sigma * np.sqrt(T))
 
 
 # ---------------------------------------------------------------------------
 # Realistic EUR/USD market data (March 2026 style)
-# Standard FX vol surface in delta notation:
-#   Tenors : 1W, 1M, 3M, 6M, 1Y, 2Y
-#   Pillars : 10D Put, 25D Put, ATM, 25D Call, 10D Call
-# Vols are quoted as % implied vol (mid market)
 # ---------------------------------------------------------------------------
 FX_OPTION_INSTRUMENTS = pd.DataFrame({
     "Tenor":        ["1W",  "1W",  "1W",  "1W",  "1W",
@@ -109,8 +65,6 @@ FX_OPTION_INSTRUMENTS = pd.DataFrame({
                      "Put","Put","Call","Call","Call",
                      "Put","Put","Call","Call","Call",
                      "Put","Put","Call","Call","Call"],
-    # Realistic EUR/USD mid-market implied vols (%) – March 2026
-    # U-shaped smile: wings > ATM, put wing slightly higher than call wing (risk reversal)
     "Market Vol (%)": [6.90, 6.50, 6.20, 6.45, 6.85,
                        7.20, 6.80, 6.50, 6.75, 7.15,
                        7.80, 7.30, 6.90, 7.25, 7.75,
@@ -139,17 +93,11 @@ FX_OPTION_INSTRUMENTS = pd.DataFrame({
     "Settlement":     ["Spot"]*30,
 })
 
-# Canonical left-to-right ordering of delta pillars (most OTM put -> ATM -> most OTM call)
-# Used as integer x-positions so Plotly cannot re-sort them numerically
 DELTA_PILLAR_ORDER = ["10D Put", "25D Put", "ATM", "25D Call", "10D Call"]
-DELTA_PILLAR_X    = {lbl: i for i, lbl in enumerate(DELTA_PILLAR_ORDER)}  # {"10D Put":0, ..., "10D Call":4}
+DELTA_PILLAR_X    = {lbl: i for i, lbl in enumerate(DELTA_PILLAR_ORDER)}
 
 
 def _build_vol_surface_from_instruments(instruments_df, spot, rd, rf):
-    """
-    Convert delta-quoted instrument table into (strike, expiry, vol) triples
-    suitable for the FXStochasticLocalVol model.
-    """
     records = []
     for _, row in instruments_df.iterrows():
         T     = float(row["Expiry (Years)"])
@@ -157,9 +105,7 @@ def _build_vol_surface_from_instruments(instruments_df, spot, rd, rf):
         delta = float(row["Delta"])
         is_put = delta < 0
         delta_abs = abs(delta)
-
         if row["Instrument"] == "ATM":
-            # DNS ATM: K = F * exp(0.5 * sigma^2 * T)
             F      = spot * np.exp((rd - rf) * T)
             strike = F * np.exp(0.5 * vol**2 * T)
         else:
@@ -168,19 +114,15 @@ def _build_vol_surface_from_instruments(instruments_df, spot, rd, rf):
             except Exception:
                 F      = spot * np.exp((rd - rf) * T)
                 strike = F * np.exp(0.5 * vol**2 * T)
-
         records.append({
-            "Strike":          round(strike, 5),
+            "Strike":         round(strike, 5),
             "Expiry (Years)": T,
-            "Volatility (%)": float(row["Market Vol (%)"])
+            "Volatility (%)":  float(row["Market Vol (%)"])
         })
     return pd.DataFrame(records)
 
 
 def render_fx_slv_section():
-    """
-    Render the FX-SLV model section
-    """
     st.header("FX Stochastic Local Volatility Model")
 
     if 'fx_curves' not in st.session_state or st.session_state.fx_curves is None:
@@ -188,7 +130,7 @@ def render_fx_slv_section():
         return
 
     if ql is None:
-        st.error("QuantLib is not installed. Please install it to use FX-SLV features.")
+        st.error("QuantLib is not installed.")
         return
 
     fx_curves = st.session_state.fx_curves
@@ -200,10 +142,14 @@ def render_fx_slv_section():
     except Exception:
         rd, rf = 0.053, 0.035
 
+    # FIX: use the canonical eval date from market_data, not a hardcoded stale date
+    eval_date = get_eval_date()
+    ql.Settings.instance().evaluationDate = eval_date
+
     st.markdown("---")
 
     # -----------------------------------------------------------------------
-    # 1. FX OPTIONS INSTRUMENT TABLE
+    # 1. INSTRUMENT TABLE
     # -----------------------------------------------------------------------
     st.subheader("FX Volatility Surface – Calibration Instruments")
     st.info(
@@ -245,154 +191,80 @@ def render_fx_slv_section():
         unique_expiries = sorted(instruments_df["Expiry (Years)"].unique())
         tenor_map = (
             instruments_df[["Expiry (Years)", "Tenor"]]
-            .drop_duplicates()
-            .set_index("Expiry (Years)")["Tenor"]
-            .to_dict()
+            .drop_duplicates().set_index("Expiry (Years)")["Tenor"].to_dict()
         )
-        colors = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
+        colors = ["#1f77b4","#d62728","#2ca02c","#ff7f0e","#9467bd","#8c564b"]
 
-        # -------------------------------------------------------------------
-        # PANEL 1 – DELTA SPACE
-        # Fix: use integer x-positions {0,1,2,3,4} mapped to pillar labels.
-        # This prevents Plotly from re-ordering the axis numerically.
-        # -------------------------------------------------------------------
-        st.write("**Panel 1 – Delta Space (FX Interbank Convention)**")
-        st.caption(
-            "X-axis uses standard FX delta notation: 10DP · 25DP · ATM · 25DC · 10DC. "
-            "This is how FX vol smiles are quoted in the interbank market."
-        )
-
+        st.write("**Panel 1 – Delta Space**")
         fig_delta = go.Figure()
-
         for i, T in enumerate(unique_expiries):
             tenor_label = tenor_map.get(T, f"{T:.2f}Y")
-            subset      = instruments_df[instruments_df["Expiry (Years)"] == T].copy()
-
+            subset = instruments_df[instruments_df["Expiry (Years)"] == T].copy()
             xs, ys, htexts = [], [], []
-            for lbl in DELTA_PILLAR_ORDER:          # always left → right
+            for lbl in DELTA_PILLAR_ORDER:
                 row = subset[subset["Instrument"] == lbl]
-                if row.empty:
-                    continue
-                xs.append(DELTA_PILLAR_X[lbl])      # integer position 0..4
+                if row.empty: continue
+                xs.append(DELTA_PILLAR_X[lbl])
                 ys.append(float(row.iloc[0]["Market Vol (%)"]))
                 htexts.append(lbl)
-
-            color = colors[i % len(colors)]
+            c = colors[i % len(colors)]
             fig_delta.add_trace(go.Scatter(
-                x=xs, y=ys,
-                mode="markers+lines",
-                name=tenor_label,
-                marker=dict(size=9, color=color),
-                line=dict(width=2, color=color),
+                x=xs, y=ys, mode="markers+lines", name=tenor_label,
+                marker=dict(size=9, color=c), line=dict(width=2, color=c),
                 text=htexts,
                 hovertemplate="<b>%{text}</b><br>Vol: %{y:.2f}%<extra>" + tenor_label + "</extra>",
             ))
-
         fig_delta.update_layout(
             title="EUR/USD Volatility Smile – Delta Space",
-            xaxis=dict(
-                tickmode="array",
-                tickvals=list(DELTA_PILLAR_X.values()),   # [0,1,2,3,4]
-                ticktext=DELTA_PILLAR_ORDER,              # ["10D Put",...,"10D Call"]
-                title="Delta Pillar",
-                range=[-0.5, 4.5],                        # small padding on each side
-            ),
-            yaxis_title="Implied Volatility (%)",
-            height=480,
-            hovermode="closest",
-            legend=dict(title="Tenor"),
+            xaxis=dict(tickmode="array", tickvals=list(DELTA_PILLAR_X.values()),
+                       ticktext=DELTA_PILLAR_ORDER, title="Delta Pillar", range=[-0.5, 4.5]),
+            yaxis_title="Implied Volatility (%)", height=480, hovermode="closest",
         )
-
-        # ATM vertical reference at integer position 2
-        fig_delta.add_vline(
-            x=DELTA_PILLAR_X["ATM"],
-            line_dash="dot", line_color="grey",
-            annotation_text="ATM", annotation_position="top right"
-        )
-
+        fig_delta.add_vline(x=DELTA_PILLAR_X["ATM"], line_dash="dot", line_color="grey",
+                            annotation_text="ATM", annotation_position="top right")
         st.plotly_chart(fig_delta, use_container_width=True, key="fx_smile_delta")
 
-        # -------------------------------------------------------------------
-        # PANEL 2 – FX RATE (STRIKE) SPACE
-        # Fix: corrected delta_to_strike so put deltas map to K < ATM and
-        # call deltas map to K > ATM, giving the proper U-shaped smile.
-        # -------------------------------------------------------------------
-        st.write("**Panel 2 – FX Rate Space (Delta Converted to EUR/USD Strikes)**")
-        st.caption(
-            "Same smiles plotted against the implied EUR/USD strike for each delta pillar. "
-            "Put-wing strikes sit left of spot/ATM; call-wing strikes sit to the right. "
-            "The U-shaped smile is preserved."
-        )
-
+        st.write("**Panel 2 – Strike Space**")
         fig_strike = go.Figure()
-
         for i, T in enumerate(unique_expiries):
             tenor_label = tenor_map.get(T, f"{T:.2f}Y")
-            subset      = instruments_df[instruments_df["Expiry (Years)"] == T].copy()
-
+            subset = instruments_df[instruments_df["Expiry (Years)"] == T].copy()
             strike_xs, vol_ys, hover_texts = [], [], []
-
-            for lbl in DELTA_PILLAR_ORDER:          # collect in pillar order
+            for lbl in DELTA_PILLAR_ORDER:
                 row = subset[subset["Instrument"] == lbl]
-                if row.empty:
-                    continue
+                if row.empty: continue
                 vol_pct   = float(row.iloc[0]["Market Vol (%)"])
                 vol_dec   = vol_pct / 100.0
                 delta_val = float(row.iloc[0]["Delta"])
                 is_put    = delta_val < 0
-                delta_abs = abs(delta_val)
-
                 if lbl == "ATM":
                     F = spot_fx * np.exp((rd - rf) * T)
                     K = F * np.exp(0.5 * vol_dec**2 * T)
                 else:
                     try:
-                        K = delta_to_strike(delta_abs, spot_fx, T, rd, rf, vol_dec, is_put=is_put)
+                        K = delta_to_strike(abs(delta_val), spot_fx, T, rd, rf, vol_dec, is_put=is_put)
                     except Exception:
                         continue
-
                 strike_xs.append(round(K, 5))
                 vol_ys.append(vol_pct)
                 hover_texts.append(f"{lbl} | K={K:.4f}")
-
-            # Sort by ascending strike so the line draws cleanly left → right
-            if not strike_xs:
-                continue
+            if not strike_xs: continue
             order = np.argsort(strike_xs)
-            xs_s  = [strike_xs[j]    for j in order]
-            ys_s  = [vol_ys[j]       for j in order]
-            ht_s  = [hover_texts[j]  for j in order]
-
-            color = colors[i % len(colors)]
+            c = colors[i % len(colors)]
             fig_strike.add_trace(go.Scatter(
-                x=xs_s, y=ys_s,
-                mode="markers+lines",
-                name=tenor_label,
-                marker=dict(size=9, color=color),
-                line=dict(width=2, color=color),
-                text=ht_s,
+                x=[strike_xs[j] for j in order], y=[vol_ys[j] for j in order],
+                mode="markers+lines", name=tenor_label,
+                marker=dict(size=9, color=c), line=dict(width=2, color=c),
+                text=[hover_texts[j] for j in order],
                 hovertemplate="<b>%{text}</b><br>Vol: %{y:.2f}%<extra>" + tenor_label + "</extra>",
             ))
-
-        fig_strike.add_vline(
-            x=spot_fx, line_dash="dash", line_color="black",
-            annotation_text=f"Spot {spot_fx:.4f}", annotation_position="top left"
-        )
-        fwd_1y = spot_fx * np.exp((rd - rf) * 1.0)
-        fig_strike.add_vline(
-            x=fwd_1y, line_dash="dot", line_color="grey",
-            annotation_text=f"1Y Fwd {fwd_1y:.4f}", annotation_position="top right"
-        )
-
+        fig_strike.add_vline(x=spot_fx, line_dash="dash", line_color="black",
+                             annotation_text=f"Spot {spot_fx:.4f}", annotation_position="top left")
         fig_strike.update_layout(
-            title="EUR/USD Volatility Smile – FX Rate (Strike) Space",
-            xaxis_title="EUR/USD Strike",
-            yaxis_title="Implied Volatility (%)",
-            height=480,
-            hovermode="closest",
-            legend=dict(title="Tenor"),
+            title="EUR/USD Volatility Smile – Strike Space",
+            xaxis_title="EUR/USD Strike", yaxis_title="Implied Volatility (%)",
+            height=480, hovermode="closest",
         )
-
         st.plotly_chart(fig_strike, use_container_width=True, key="fx_smile_strike")
 
     st.markdown("---")
@@ -401,36 +273,41 @@ def render_fx_slv_section():
     # Model Configuration
     # -----------------------------------------------------------------------
     st.subheader("FX-SLV Model Parameters")
-    st.info(
-        "💡 The FX-SLV model uses Heston stochastic volatility combined with local "
-        "volatility (Dupire). Parameters will be calibrated to the market vol surface above."
-    )
 
     st.write("**Calibration Settings**")
     calibration_mode = st.radio(
         "Calibration Mode",
         options=["Reduced Set (Recommended)", "Full Surface"],
         index=0,
-        help="Reduced Set: ATM + wings for key expiries. Full Surface: all instruments.",
+        help="Reduced Set: ATM + 25D for all expiries (well-conditioned). Full: all 30 instruments.",
         horizontal=True,
         key="fx_slv_calib_mode",
     )
 
     if calibration_mode == "Reduced Set (Recommended)":
-        st.success("✅ Reduced set calibration uses ATM + near-strikes for optimal fit. Expected RMSE: < 20 bps")
+        st.success("✅ Reduced set: ATM + 25D Put + 25D Call per expiry = 18 instruments. Target RMSE < 10 bps")
     else:
-        st.warning("⚠️ Full surface calibration may result in larger errors (RMSE > 30 bps) due to overfitting")
+        st.warning("⚠️ Full surface (30 instruments). Heston cannot perfectly fit all wings — RMSE 20-40 bps is normal.")
 
-    st.write("**Initial Parameter Guesses (FX-typical values)**")
+    st.write("**Initial Parameter Guesses**")
+    st.caption(
+        "v0 and θ are variances: to get ~7% initial vol enter 0.0049 (= 0.07²). "
+        "σ (vol-of-vol) must be > 0. ρ is typically negative for FX."
+    )
     col1, col2 = st.columns(2)
     with col1:
-        v0    = st.number_input("Initial Variance (v0)",   value=0.014, format="%.4f", key="fx_slv_v0")
-        kappa = st.number_input("Mean Reversion (κ)",       value=2.0,   format="%.4f", key="fx_slv_kappa")
-        theta = st.number_input("Long-term Variance (θ)",   value=0.014, format="%.4f", key="fx_slv_theta")
+        # FIX: defaults changed to match ATM vol level (~6.5% => v0=0.0042)
+        v0    = st.number_input("Initial Variance (v0)",  value=0.0042, format="%.6f", key="fx_slv_v0",
+                                help="Variance = vol². 6.5% vol => 0.0042")
+        kappa = st.number_input("Mean Reversion (κ)",      value=1.5,    format="%.4f", key="fx_slv_kappa")
+        theta = st.number_input("Long-term Variance (θ)",  value=0.0056, format="%.6f", key="fx_slv_theta",
+                                help="Long-run variance. 7.5% vol => 0.0056")
     with col2:
-        sigma = st.number_input("Vol-of-Vol (σ)",           value=0.4,   format="%.4f", key="fx_slv_sigma")
-        rho   = st.number_input("Correlation (ρ)",          value=-0.6,  format="%.4f",
-                                min_value=-1.0, max_value=1.0, key="fx_slv_rho")
+        sigma = st.number_input("Vol-of-Vol (σ)",          value=0.30,   format="%.4f", key="fx_slv_sigma",
+                                help="Must be > 0. Typical FX range: 0.15 – 0.60")
+        rho   = st.number_input("Correlation (ρ)",         value=-0.30,  format="%.4f",
+                                min_value=-0.99, max_value=0.99, key="fx_slv_rho",
+                                help="Typically -0.1 to -0.4 for EUR/USD")
 
     st.markdown("---")
 
@@ -446,55 +323,40 @@ def render_fx_slv_section():
         with st.spinner("Calibrating FX-SLV model to volatility surface..."):
             try:
                 if calibration_mode == "Reduced Set (Recommended)":
-                    unique_expiries_calib = sorted(vol_surface_df["Expiry (Years)"].unique())
-                    selected_options = []
-
-                    for expiry in unique_expiries_calib[:2]:
-                        expiry_data = vol_surface_df[vol_surface_df["Expiry (Years)"] == expiry].sort_values("Strike")
-                        if expiry_data.empty:
-                            continue
-                        strikes_sorted = expiry_data["Strike"].values
-                        atm_idx = np.argmin(np.abs(strikes_sorted - spot_fx))
-                        idxs = [atm_idx]
-                        if atm_idx > 0:                         idxs.insert(0, atm_idx - 1)
-                        if atm_idx < len(strikes_sorted) - 1:  idxs.append(atm_idx + 1)
-                        for ii in idxs:
-                            r = expiry_data.iloc[ii]
-                            selected_options.append({"Strike": r["Strike"],
-                                                     "Expiry (Years)": r["Expiry (Years)"],
-                                                     "Volatility (%)": r["Volatility (%)"],})
-
-                    for expiry in unique_expiries_calib[2:]:
-                        expiry_data = vol_surface_df[vol_surface_df["Expiry (Years)"] == expiry]
-                        if expiry_data.empty:
-                            continue
-                        atm_row = expiry_data.iloc[(expiry_data["Strike"] - spot_fx).abs().argmin()]
-                        selected_options.append({"Strike": atm_row["Strike"],
-                                                 "Expiry (Years)": atm_row["Expiry (Years)"],
-                                                 "Volatility (%)": atm_row["Volatility (%)"],})
-
-                    calibration_df = pd.DataFrame(selected_options)
-                    if len(calibration_df) < 5:
-                        st.error(f"❌ Need at least 5 options (found {len(calibration_df)}). Add more data.")
-                        st.stop()
-                    st.info(f"🎯 Calibrating to {len(calibration_df)} selected options")
+                    # FIX: use ATM + 25D Put + 25D Call for ALL expiries
+                    # This gives 18 well-conditioned helpers vs the old 10
+                    # and covers both ATM and skew information.
+                    REDUCED_INSTRUMENTS = ["ATM", "25D Put", "25D Call"]
+                    reduced_df = instruments_df[
+                        instruments_df["Instrument"].isin(REDUCED_INSTRUMENTS)
+                    ].copy()
+                    calibration_surface = _build_vol_surface_from_instruments(
+                        reduced_df, spot_fx, rd, rf
+                    )
+                    st.info(f"🎯 Calibrating to {len(calibration_surface)} instruments "
+                            f"(ATM + 25D Put + 25D Call × 6 expiries)")
                 else:
-                    calibration_df = vol_surface_df.copy()
-                    st.info(f"🎯 Calibrating to {len(calibration_df)} options (full surface)")
+                    calibration_surface = vol_surface_df.copy()
+                    st.info(f"🎯 Calibrating to {len(calibration_surface)} instruments (full surface)")
 
-                # BUG FIX: vol_surface_df stores vols as % (e.g. 7.5), but FXStochasticLocalVol
-                # expects decimals (e.g. 0.075). Divide by 100 here.
+                # Vols are stored as % in the DataFrame; divide by 100 for the model
                 vol_surface_data = [
-                    [float(r["Strike"]), float(r["Expiry (Years)"]), float(r["Volatility (%)"]) / 100.0]
-                    for _, r in calibration_df.iterrows()
+                    [float(r["Strike"]),
+                     float(r["Expiry (Years)"]),
+                     float(r["Volatility (%)"]) / 100.0]
+                    for _, r in calibration_surface.iterrows()
                 ]
 
-                model_params = {"v0": v0, "kappa": kappa, "theta": theta, "sigma": sigma, "rho": rho}
+                model_params = {
+                    "v0":    float(v0),
+                    "kappa": float(kappa),
+                    "theta": float(theta),
+                    "sigma": float(sigma),
+                    "rho":   float(rho),
+                }
 
                 domestic_curve_handle = ql.YieldTermStructureHandle(fx_curves.usd_curve)
                 foreign_curve_handle  = ql.YieldTermStructureHandle(fx_curves.eur_curve)
-
-                eval_date = ql.Date(8, 3, 2026)
 
                 fx_slv = FXStochasticLocalVol(
                     eval_date, spot_fx,
@@ -530,11 +392,16 @@ def render_fx_slv_section():
         if results:
             st.write("**Calibrated Heston Parameters**")
             col1, col2, col3, col4, col5 = st.columns(5)
-            with col1: st.metric("v0", f"{results['v0']:.6f}",    help=f"Vol: {np.sqrt(results['v0'])*100:.2f}%")
-            with col2: st.metric("κ",  f"{results['kappa']:.6f}")
-            with col3: st.metric("θ",  f"{results['theta']:.6f}", help=f"Vol: {np.sqrt(results['theta'])*100:.2f}%")
-            with col4: st.metric("σ",  f"{results['sigma']:.6f}")
-            with col5: st.metric("ρ",  f"{results['rho']:.6f}")
+            with col1: st.metric("v0",  f"{results['v0']:.6f}",    help=f"≈ {np.sqrt(abs(results['v0']))*100:.2f}% vol")
+            with col2: st.metric("κ",   f"{results['kappa']:.6f}")
+            with col3: st.metric("θ",   f"{results['theta']:.6f}", help=f"≈ {np.sqrt(abs(results['theta']))*100:.2f}% vol")
+            with col4: st.metric("σ",   f"{results['sigma']:.6f}")
+            with col5: st.metric("ρ",   f"{results['rho']:.6f}")
+
+            feller = 2 * results['kappa'] * results['theta'] - results['sigma']**2
+            feller_color = "green" if feller > 0 else "red"
+            st.markdown(f"Feller condition (2κθ − σ²): :{feller_color}[**{feller:.6f}**] "
+                        f"({'✅ satisfied' if feller > 0 else '⚠️ violated – variance can hit 0'})")
             st.write("")
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -551,10 +418,10 @@ def render_fx_slv_section():
                 rmse      = np.sqrt((errors_df['vol_error_bps']**2).mean())
                 max_error = errors_df['vol_error_bps'].abs().max()
 
-                if   rmse < 10: quality_msg, quality_color = "🌟 Excellent calibration quality (RMSE < 10 bps)", "green"
-                elif rmse < 20: quality_msg, quality_color = "✅ Good calibration quality (RMSE < 20 bps)", "blue"
-                elif rmse < 30: quality_msg, quality_color = "⚠️ Acceptable calibration (RMSE < 30 bps)", "orange"
-                else:           quality_msg, quality_color = "❌ Poor calibration (RMSE > 30 bps). Try reduced set mode.", "red"
+                if   rmse < 10: quality_msg, quality_color = "🌟 Excellent (RMSE < 10 bps)",  "green"
+                elif rmse < 20: quality_msg, quality_color = "✅ Good (RMSE < 20 bps)",        "blue"
+                elif rmse < 30: quality_msg, quality_color = "⚠️ Acceptable (RMSE < 30 bps)",  "orange"
+                else:           quality_msg, quality_color = "❌ Poor (RMSE > 30 bps)",         "red"
 
                 st.markdown(f":{quality_color}[**{quality_msg}**]")
                 st.write("")
@@ -572,21 +439,24 @@ def render_fx_slv_section():
                     marker=dict(size=8, color='red', symbol='circle'),
                     line=dict(width=2, color='red'),
                 ))
-                fig_vols.update_layout(title="Volatility Calibration: Market vs Model",
+                fig_vols.update_layout(
+                    title="Volatility Calibration: Market vs Model",
                     xaxis_title="Option Index", yaxis_title="Implied Volatility (%)",
-                    height=500, hovermode='closest')
+                    height=500, hovermode='closest'
+                )
                 st.plotly_chart(fig_vols, use_container_width=True, key="fx_slv_vols_chart")
 
-                st.write("**Volatility Errors (bps)**")
                 fig_vol_errors = go.Figure()
                 fig_vol_errors.add_trace(go.Bar(
                     x=[f"K={r['strike']:.4f}, T={r['expiry']:.2f}Y" for _, r in errors_df.iterrows()],
                     y=errors_df['vol_error_bps'], marker_color='orange',
                 ))
                 fig_vol_errors.add_hline(y=0, line_dash="dash", line_color="black", line_width=2)
-                fig_vol_errors.update_layout(title="Implied Volatility Errors (Model − Market)",
+                fig_vol_errors.update_layout(
+                    title="Implied Volatility Errors (Model − Market)",
                     xaxis_title="Option", yaxis_title="Error (bps)",
-                    height=500, xaxis_tickangle=-45)
+                    height=500, xaxis_tickangle=-45
+                )
                 st.plotly_chart(fig_vol_errors, use_container_width=True, key="fx_slv_vol_errors_chart")
 
                 col1, col2, col3, col4 = st.columns(4)
@@ -597,13 +467,7 @@ def render_fx_slv_section():
 
             # -----------------------------------------------------------
             with tab2:
-                st.write("**Market vs Model Option Prices – Arbitrage Check**")
-                st.info(
-                    "💡 A well-calibrated, arbitrage-free model should have model prices lying "
-                    "on or very close to the 45° line. Points outside the ±2% band indicate "
-                    "mis-pricing; systematic bias suggests calendar or butterfly arbitrage."
-                )
-
+                st.write("**Market vs Model Option Prices**")
                 errors_df    = results['pricing_errors']
                 inst_df_used = st.session_state.get('fx_slv_instruments_used', instruments_df)
 
@@ -626,7 +490,6 @@ def render_fx_slv_section():
                 unique_tenors = errors_df['tenor_label'].unique().tolist()
                 colors_tab    = ["#1f77b4","#d62728","#2ca02c","#ff7f0e","#9467bd","#8c564b","#e377c2"]
 
-                # ---- FIX: Line plot instead of scatter, sorted by market_price per tenor ----
                 fig_mv = go.Figure()
                 for ti, tenor in enumerate(unique_tenors):
                     sub = errors_df[errors_df['tenor_label'] == tenor].sort_values('market_price')
@@ -646,10 +509,8 @@ def render_fx_slv_section():
                 p_min, p_max = all_prices.min(), all_prices.max()
                 pad      = (p_max - p_min) * 0.05
                 ref_line = [p_min - pad, p_max + pad]
-
                 fig_mv.add_trace(go.Scatter(
-                    x=ref_line, y=ref_line, mode='lines',
-                    name='Perfect Fit (45°)',
+                    x=ref_line, y=ref_line, mode='lines', name='Perfect Fit (45°)',
                     line=dict(color='black', width=2, dash='dash'), hoverinfo='skip',
                 ))
                 fig_mv.add_trace(go.Scatter(
@@ -666,7 +527,6 @@ def render_fx_slv_section():
                 )
                 st.plotly_chart(fig_mv, use_container_width=True, key="fx_mv_scatter")
 
-                st.write("**Price Error by Instrument (Model − Market, %)**")
                 bar_colors = ["#2ca02c" if abs(v) <= 2.0 else "#d62728"
                               for v in errors_df['price_error_pct']]
                 fig_price_err = go.Figure()
@@ -692,9 +552,9 @@ def render_fx_slv_section():
                 n_outside = (errors_df['price_error_pct'].abs() > 2.0).sum()
                 n_total   = len(errors_df)
                 if n_outside == 0:
-                    st.success(f"✅ All {n_total} instruments price within ±2% tolerance. No pricing arbitrage detected.")
+                    st.success(f"✅ All {n_total} instruments within ±2% tolerance.")
                 else:
-                    st.warning(f"⚠️ {n_outside}/{n_total} instruments price outside ±2% tolerance. Review calibration.")
+                    st.warning(f"⚠️ {n_outside}/{n_total} instruments outside ±2% tolerance.")
 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1: st.metric("Max Price Error",         f"{errors_df['price_error_pct'].abs().max():.2f}%")
@@ -716,7 +576,6 @@ def render_fx_slv_section():
                         path_df, times, spot_paths, vol_paths = fx_slv.get_simulated_paths(
                             num_paths=1000, time_steps=252, horizon_years=horizon
                         )
-
                         fig_spot = go.Figure()
                         for i in range(min(num_paths, 1000)):
                             fig_spot.add_trace(go.Scatter(x=times, y=spot_paths[:, i], mode='lines',
@@ -725,7 +584,7 @@ def render_fx_slv_section():
                             name='Mean Path', line=dict(color='red', width=3)))
                         fig_spot.add_hline(y=spot_fx, line_dash="dash", line_color="blue",
                                            annotation_text=f"Initial Spot: {spot_fx:.4f}")
-                        fig_spot.update_layout(title=f"FX Spot Simulation ({num_paths} of 1000 paths shown)",
+                        fig_spot.update_layout(title=f"FX Spot Simulation ({num_paths} paths)",
                             xaxis_title="Time (years)", yaxis_title="FX Spot Rate", height=500)
                         st.plotly_chart(fig_spot, use_container_width=True, key="fx_slv_spot_paths")
 
@@ -740,58 +599,30 @@ def render_fx_slv_section():
                             xaxis_title="Time (years)", yaxis_title="Volatility (%)", height=500)
                         st.plotly_chart(fig_vol, use_container_width=True, key="fx_slv_vol_paths")
 
-                        col1, col2, col3 = st.columns(3)
-                        with col1: st.metric("Initial Spot",             f"{spot_paths[0, 0]:.4f}")
-                        with col2: st.metric(f"Mean Spot at {horizon}Y", f"{spot_paths[-1, :].mean():.4f}")
-                        with col3: st.metric(f"Spot Std at {horizon}Y",  f"{spot_paths[-1, :].std():.4f}")
-                        col1, col2, col3 = st.columns(3)
-                        with col1: st.metric("Initial Vol",             f"{vol_paths_pct[0, 0]:.2f}%")
-                        with col2: st.metric(f"Mean Vol at {horizon}Y", f"{vol_paths_pct[-1, :].mean():.2f}%")
-                        with col3: st.metric(f"Vol Std at {horizon}Y",  f"{vol_paths_pct[-1, :].std():.2f}%")
-
             # -----------------------------------------------------------
             with tab4:
-                st.write("**Model Validation: Option Pricing vs Black-Scholes**")
-                st.info("💡 Validates model by comparing prices with Black-Scholes using market volatilities.")
-
+                st.write("**Model Validation: Heston vs Black-Scholes**")
                 if st.button("Run Validation", type="primary", key="fx_slv_validation_btn"):
                     with st.spinner("Running validation..."):
                         validation_results = fx_slv.validate_option_prices()
                         if validation_results is not None:
                             st.success("✅ Validation completed!")
-
                             fig_val = go.Figure()
                             fig_val.add_trace(go.Scatter(
                                 x=list(range(len(validation_results))), y=validation_results['bs_price'],
                                 mode='markers+lines', name='Black-Scholes Price',
-                                marker=dict(size=10, color='blue'),
-                                line=dict(width=2, color='blue')))
+                                marker=dict(size=10, color='blue'), line=dict(width=2, color='blue')))
                             fig_val.add_trace(go.Scatter(
                                 x=list(range(len(validation_results))), y=validation_results['heston_price'],
                                 mode='markers+lines', name='Heston Price',
-                                marker=dict(size=8, color='red'),
-                                line=dict(width=2, color='red')))
+                                marker=dict(size=8, color='red'), line=dict(width=2, color='red')))
                             fig_val.update_layout(title="Option Prices: Black-Scholes vs Heston",
                                 xaxis_title="Option Index", yaxis_title="Price", height=500)
                             st.plotly_chart(fig_val, use_container_width=True, key="fx_slv_val_chart")
-
-                            fig_val_error = go.Figure()
-                            fig_val_error.add_trace(go.Bar(
-                                x=[f"K={r['strike']:.2f}, T={r['expiry']:.2f}Y"
-                                   for _, r in validation_results.iterrows()],
-                                y=validation_results['price_diff_pct'], marker_color='green'))
-                            fig_val_error.add_hline(y=0, line_dash="dash", line_color="black")
-                            fig_val_error.update_layout(title="Price Differences (Heston − BS)",
-                                xaxis_title="Option", yaxis_title="Difference (%)",
-                                height=500, xaxis_tickangle=-45)
-                            st.plotly_chart(fig_val_error, use_container_width=True, key="fx_slv_val_error_chart")
-
-                            st.write("**Validation Results**")
                             st.dataframe(validation_results, use_container_width=True, hide_index=True)
 
             # -----------------------------------------------------------
             with tab5:
-                st.write("**Detailed Calibration Results**")
                 display_errors = results['pricing_errors'][[
                     'strike', 'expiry',
                     'market_vol', 'model_vol', 'vol_error_bps',
@@ -805,6 +636,6 @@ def render_fx_slv_section():
                 st.dataframe(display_errors, use_container_width=True, hide_index=True)
 
     else:
-        st.info("Click 'Calibrate FX-SLV Model' to see results")
+        st.info("Click 'Calibrate FX-SLV Model' to see results.")
 
     st.markdown("---")
