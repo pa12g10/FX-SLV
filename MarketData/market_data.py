@@ -43,10 +43,6 @@ def get_sofr_futures_data():
 
 def get_sofr_swaps_data():
     # SOFR OIS mid-market, 10-Mar-2026
-    # Short end anchored to TraditionData: 1Y = 3.519%
-    # 2Y-5Y: modest bull-steepener as Fed cuts gradually
-    # 10Y+: flattening toward long-run neutral; 15-30Y capped at ~3.85-3.90%
-    #        to avoid over-shooting convexity in the 30Y FX forward
     data = [
         ["2Y",  3.38, "Annual", "Annual", "Actual/360"],
         ["3Y",  3.42, "Annual", "Annual", "Actual/360"],
@@ -69,32 +65,25 @@ def get_sofr_swaps_data():
 # ========================
 # EUR ESTR Curve Instruments
 # ========================
-# ECB deposit rate 2.50% (cut to terminal); ESTR fixing 10-Mar-2026 = 1.933%.
-# Note: ESTR = ECB DFR - ~7bps spread; DFR currently 2.50% => ESTR ~2.43%
-# OIS curve flat to very slightly positive — ECB seen on hold through 2026.
 
 def get_estr_deposit_data():
-    # ESTR ~= ECB DFR minus ~7bps spread => ~2.43% with DFR at 2.50%
     return {'tenor': 'ON', 'rate': 2.43, 'day_count': 'Actual/360'}
 
 
 def get_estr_futures_data():
-    # ESTR futures prices consistent with ECB on hold; very slight term premium
     data = [
-        ["ER1J6",  "1M",  97.58, 2.42, "Actual/360"],  # Apr-26
-        ["ER1K6",  "1M",  97.57, 2.43, "Actual/360"],  # May-26
-        ["ER1M6",  "1M",  97.56, 2.44, "Actual/360"],  # Jun-26
-        ["ER3U6",  "3M",  97.54, 2.46, "Actual/360"],  # Sep-26
-        ["ER3Z6",  "3M",  97.52, 2.48, "Actual/360"],  # Dec-26
-        ["ER3H7",  "3M",  97.50, 2.50, "Actual/360"],  # Mar-27
-        ["ER3U7",  "3M",  97.48, 2.52, "Actual/360"],  # Sep-27
+        ["ER1J6",  "1M",  97.58, 2.42, "Actual/360"],
+        ["ER1K6",  "1M",  97.57, 2.43, "Actual/360"],
+        ["ER1M6",  "1M",  97.56, 2.44, "Actual/360"],
+        ["ER3U6",  "3M",  97.54, 2.46, "Actual/360"],
+        ["ER3Z6",  "3M",  97.52, 2.48, "Actual/360"],
+        ["ER3H7",  "3M",  97.50, 2.50, "Actual/360"],
+        ["ER3U7",  "3M",  97.48, 2.52, "Actual/360"],
     ]
     return pd.DataFrame(data, columns=['contract', 'tenor', 'price', 'rate', 'day_count'])
 
 
 def get_estr_swaps_data():
-    # ESTR OIS mid-market, 10-Mar-2026
-    # Front end pinned near 2.43-2.50%; long end drifts to ~2.80% with term premium
     data = [
         ["2Y",  2.52, "Annual", "Annual", "Actual/360"],
         ["3Y",  2.58, "Annual", "Annual", "Actual/360"],
@@ -119,7 +108,6 @@ def get_estr_swaps_data():
 # ========================
 
 def get_fx_spot():
-    # EUR/USD spot 10-Mar-2026 (TradingEconomics)
     return {'pair': 'EUR/USD', 'rate': 1.1616}
 
 
@@ -127,18 +115,19 @@ def get_fx_swap_data():
     """
     Get FX Swap market data (O/N through 2Y).
 
-    With SOFR ~3.65% and ESTR ~2.43%, the USD-EUR rate differential
-    is ~122bps - EUR trades at a forward DISCOUNT so forward points are NEGATIVE.
+    Pillars are spaced to keep the rate-of-change of forward points
+    roughly constant, preventing PiecewiseLogLinearDiscount from
+    overshooting between sparse pillars.
 
-    Forward point approximation: pts ~= spot x (r_USD - r_EUR) x T
-    1M:  1.1616 x 0.0122 x (1/12) x 10000 ~= 11.8 pips
-    18M: 1.1616 x 0.0122 x 1.5   x 10000 ~= 212 pips (market wider due to basis)
-    2Y:  linear extrapolation from 18M ~= -314 pips; basis-adjusted ~= -312 pips
-         consistent with 2Y CCY swap basis of -22.5 bps.
+    Forward points (all negative = EUR discount vs USD):
+      12M: -163.0  (rate: ~-13.6 pips/month)
+      15M: -200.5  (midpoint interpolation, ~-12.5 pips/month - smooth)
+      18M: -238.5  (rate: ~-12.7 pips/month)
+      2Y:  -312.0  (bridge to first CCY swap pillar at -22.5 bps)
     """
     spot = get_fx_spot()['rate']
     data = [
-        # -- Overnight tenors --
+        # -- Overnight tenors (skipped by bootstrapper) --
         ["O/N",   -0.4,  round(spot - 0.000040, 5), "Actual/360"],
         ["T/N",   -0.8,  round(spot - 0.000080, 5), "Actual/360"],
         ["S/N",   -1.0,  round(spot - 0.000100, 5), "Actual/360"],
@@ -151,11 +140,10 @@ def get_fx_swap_data():
         ["6M",   -84.5,  round(spot - 0.008450, 5), "Actual/360"],
         ["9M",  -124.5,  round(spot - 0.012450, 5), "Actual/360"],
         ["12M", -163.0,  round(spot - 0.016300, 5), "Actual/360"],
+        # -- 15M bridge: midpoint between 12M (-163) and 18M (-238.5) = -200.75 --
+        ["15M", -200.5,  round(spot - 0.020050, 5), "Actual/360"],
         ["18M", -238.5,  round(spot - 0.023850, 5), "Actual/360"],
-        # -- 2Y bridge pillar: smooths the seam to the first CCY swap at 2Y -22.5bps --
-        # CIP forward (2Y SOFR 3.38%, ESTR 2.52%): F = 1.1616 * exp(0.0086*2) = 1.1817
-        # Basis-adjusted (~-22bps over 2Y adds ~25 pips): outright ~ 1.1842
-        # => forward points = (1.1842 - 1.1616) * 10000 = -312 pips (negative = EUR discount)
+        # -- 2Y bridge: consistent with 2Y CCY swap basis of -22.5 bps --
         ["2Y",  -312.0,  round(spot - 0.031200, 5), "Actual/360"],
     ]
     return pd.DataFrame(data, columns=['tenor', 'points', 'outright', 'day_count'])
@@ -163,9 +151,7 @@ def get_fx_swap_data():
 
 def get_ccy_swaps_data():
     """
-    Get Mark-to-Market Cross-Currency Basis Swaps (EUR/USD).
-
-    EUR/USD xccy basis structurally negative since 2008.
+    Mark-to-Market Cross-Currency Basis Swaps (EUR/USD, 2Y-30Y).
     Convention: ESTR flat vs SOFR + basis spread (bps).
     """
     data = [
