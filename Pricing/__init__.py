@@ -2,7 +2,7 @@
 from .deposits import DepositPricer
 from .futures import FuturesPricer
 from .swaps import SwapPricer
-from .fx_forwards import FXForwardPricer
+from .fx_swaps import FXForwardPricer
 from .ccy_swaps import CCYSwapPricer
 
 __all__ = [
