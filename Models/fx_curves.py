@@ -38,6 +38,10 @@ class FXCurves:
         self.fx_forwards_data = None
         self.ccy_swaps_data = None
 
+        # Basis curve node bounds (set after bootstrap)
+        self._basis_min_t = None   # smallest knot in years (2.0)
+        self._basis_max_t = None   # largest knot in years  (30.0)
+
         # Basis curve
         self.basis_curve = None
         self.basis_spreads = {}   # {tenor_years: quoted_basis_bps}
@@ -101,10 +105,13 @@ class FXCurves:
             self.basis_spreads[t_years] = basis_bps
             print(f"  {tenor}: {basis_bps:.1f} bps")
 
-        self.basis_curve = ql.LinearInterpolation(tenors_list, basis_list)
+        self._basis_min_t = min(tenors_list)
+        self._basis_max_t = max(tenors_list)
+        self.basis_curve  = ql.LinearInterpolation(tenors_list, basis_list)
 
         print(f"\n\u2705 Basis curve constructed with {len(tenors_list)} points")
         print(f"   Basis range: {min(basis_list)*10000:.1f} to {max(basis_list)*10000:.1f} bps")
+        print(f"   Tenor domain: {self._basis_min_t:.2f}Y - {self._basis_max_t:.0f}Y")
 
         print(f"\n\U0001f4ca Comparing FX Forward implied basis vs CCY swap basis:")
         self._compare_forward_vs_basis()
@@ -123,9 +130,11 @@ class FXCurves:
 
         FX Swaps (1W - 18M)
         -------------------
-        Market rate : quoted outright forward from fx_forwards_data.
-        Model rate  : basis-adjusted forward from get_basis_adjusted_forward().
-        Error (bps) : (model_outright - market_outright) * 10,000
+        The basis curve is defined only from its first CCY swap pillar (2Y) onwards.
+        FX swap tenors are all below that, so the appropriate model rate is the
+        plain CIP forward (no basis adjustment):
+            model_outright = spot * df_eur / df_usd
+        Error (bps) = (model_outright - market_outright) * 10,000
 
         CCY Swaps (2Y - 30Y)
         --------------------
@@ -144,20 +153,22 @@ class FXCurves:
             raise ValueError("Basis curve not bootstrapped yet.")
 
         rows = []
-
-        # Overnight tenors (O/N, T/N, S/N) are excluded - they predate spot
         _SKIP = {'O/N', 'T/N', 'S/N'}
 
         # --- FX Swap instruments ---
+        # All FX swap tenors (1W-18M) lie BELOW the basis curve domain (2Y-30Y).
+        # Use the standard CIP forward (df_eur/df_usd * spot) as the model rate.
         for _, row in self.fx_forwards_data.iterrows():
             tenor = row['tenor']
             if tenor in _SKIP:
                 continue
             market_outright = row['outright']
             try:
-                t_years        = self._parse_tenor_to_years(tenor)
-                model_result   = self.get_basis_adjusted_forward(t_years)
-                model_outright = model_result['adjusted_forward']
+                t_years = self._parse_tenor_to_years(tenor)
+                df_usd  = self.usd_curve.discount(t_years)
+                df_eur  = self.eur_curve.discount(t_years)
+                # Plain CIP forward - no basis adjustment below domain
+                model_outright = self.spot_fx * df_eur / df_usd
                 error_bps      = (model_outright - market_outright) * 10_000
                 rows.append({
                     'instrument':      f"FX Swap {tenor}",
@@ -167,7 +178,6 @@ class FXCurves:
                     'error_bps':       error_bps,
                 })
             except Exception as exc:
-                # surface errors rather than silently dropping
                 rows.append({
                     'instrument':      f"FX Swap {tenor}",
                     'instrument_type': 'FX Swaps',
@@ -195,7 +205,6 @@ class FXCurves:
                 pass
 
         df = pd.DataFrame(rows)
-        # Drop rows where the error could not be computed
         return df.dropna(subset=['error_bps'])
 
     # ------------------------------------------------------------------
@@ -205,10 +214,7 @@ class FXCurves:
     def _parse_tenor_to_years(self, tenor_str):
         """
         Convert a tenor string to a fractional year value.
-
         Supported suffixes: W (weeks), M (months), Y (years).
-        Examples: '1W' -> 1/52, '2W' -> 2/52, '1M' -> 1/12,
-                  '18M' -> 1.5, '2Y' -> 2.0, '30Y' -> 30.0
         """
         tenor_str = tenor_str.upper().strip()
         if tenor_str.endswith('W'):
@@ -247,14 +253,28 @@ class FXCurves:
     # ------------------------------------------------------------------
 
     def get_basis_adjusted_forward(self, tenor_years):
+        """
+        Calculate basis-adjusted FX forward.
+        For tenors within the basis curve domain [_basis_min_t, _basis_max_t],
+        the basis spread is applied. Outside the domain, plain CIP forward is returned.
+        """
         if self.usd_curve is None or self.eur_curve is None:
             raise ValueError("Curves not bootstrapped yet")
+
         df_usd           = self.usd_curve.discount(tenor_years)
         df_eur           = self.eur_curve.discount(tenor_years)
         standard_forward = self.spot_fx * df_eur / df_usd
-        basis_spread     = self.basis_curve(tenor_years) if self.basis_curve is not None else 0.0
+
+        # Only apply basis if within interpolation domain
+        in_domain = (
+            self.basis_curve is not None
+            and self._basis_min_t is not None
+            and self._basis_min_t <= tenor_years <= self._basis_max_t
+        )
+        basis_spread     = self.basis_curve(tenor_years) if in_domain else 0.0
         df_usd_adjusted  = df_usd / (1 + basis_spread * tenor_years)
         adjusted_forward = self.spot_fx * df_eur / df_usd_adjusted
+
         return {
             'tenor_years':        tenor_years,
             'spot':               self.spot_fx,
