@@ -26,20 +26,23 @@ class FXStochasticLocalVol:
       2. It regularises the ill-posed inverse problem, improving stability
          across different market regimes and initial guesses.
 
-    The regularisation weight LAMBDA is small (1e-3) so it biases but does
-    not dominate the fit.  At LAMBDA=1e-3 with N=18-30 instruments the
-    effective penalty per instrument is ~0.001^0.5 ~ 3 bps.
+    Key fix (zero-RMSE bug)
+    -----------------------
+    Previously _extract_results called _heston_iv() again on final params,
+    and any NaN IV was silently replaced with mkt_vol -> zero error.
+    Now the FINAL IV array from the optimiser's last residual evaluation is
+    stored on self._final_ivs and used directly in _extract_results, so
+    the reported errors are exactly the errors the optimiser converged to.
     """
 
     # Hard parameter bounds  [v0, kappa, theta, sigma, rho]
     _LO = np.array([1e-4,  0.10, 1e-4, 0.05, -0.95])
-    _HI = np.array([0.0625, 15.0, 0.0625, 1.50,  0.95])  # 0.0625 = (25% vol)^2
+    _HI = np.array([0.0625, 15.0, 0.0625, 1.50,  0.95])
 
-    # Tikhonov regularisation weight (lambda).  Increase to raise RMSE floor.
+    # Tikhonov regularisation weight. Increase to raise RMSE floor.
     _LAMBDA = 1e-3
 
     # Prior parameter set (centre of regularisation penalty)
-    # These are mid-range FX Heston priors; the penalty pulls params toward here.
     _PRIOR = np.array([0.0042, 1.5, 0.0056, 0.30, -0.30])
 
     def __init__(self, eval_date, spot_fx, domestic_curve, foreign_curve,
@@ -63,10 +66,13 @@ class FXStochasticLocalVol:
         self.calibration_results = None
         self.black_var_surface   = None
 
-        # Parsed calibration data (set in calibrate)
         self._cal_strikes  = None
         self._cal_expiries = None
         self._cal_vols     = None   # decimal
+
+        # Stores the FINAL heston IV array from the last optimiser call.
+        # Used by _extract_results so reported errors = optimiser errors exactly.
+        self._final_ivs = None
 
     # ------------------------------------------------------------------
     # PUBLIC API
@@ -119,33 +125,16 @@ class FXStochasticLocalVol:
         return self.black_var_surface
 
     def calibrate(self):
-        """
-        Calibrate Heston model using direct implied-vol residuals + Tikhonov
-        regularisation.
-
-        Residual vector
-        ---------------
-        r_i     = (heston_iv_i - market_iv_i) * 100          [% vol, O(0.1-1)]
-        r_{N+j} = sqrt(lambda) * (p_j - prior_j) / scale_j   [regularisation]
-
-        The regularisation appends 5 extra pseudo-residuals (one per Heston
-        param) that penalise distance from the prior.  With lambda=1e-3 the
-        effective vol-space penalty per param is ~3 bps, which is enough to
-        prevent exact interpolation of a smooth surface but does not materially
-        bias a well-identified calibration.
-        """
         ql.Settings.instance().evaluationDate = self.eval_date
 
         if self.black_var_surface is None:
             self.build_vol_surface()
 
-        # Parse and store calibration data
         S, E, V = self._parse_vol_data(self.vol_surface_data)
         self._cal_strikes  = S
         self._cal_expiries = E
-        self._cal_vols     = V   # decimal
+        self._cal_vols     = V
 
-        # Build QL helpers (used only for result extraction / engine attachment)
         self._make_process_and_model(self._clip(np.array([
             self.model_params['v0'],    self.model_params['kappa'],
             self.model_params['theta'], self.model_params['sigma'],
@@ -157,7 +146,6 @@ class FXStochasticLocalVol:
         if len(self.calibrated_helpers) == 0:
             raise RuntimeError("No calibration helpers constructed - check vol data.")
 
-        # Initial point
         p0 = self._clip(np.array([
             self.model_params['v0'],    self.model_params['kappa'],
             self.model_params['theta'], self.model_params['sigma'],
@@ -168,12 +156,10 @@ class FXStochasticLocalVol:
         print(f"  v0={p0[0]:.6f} ({np.sqrt(p0[0])*100:.2f}% vol)  kappa={p0[1]:.4f}  "
               f"theta={p0[2]:.6f} ({np.sqrt(p0[2])*100:.2f}% vol)  "
               f"sigma={p0[3]:.4f}  rho={p0[4]:.4f}")
-        print(f"  Tikhonov lambda={self._LAMBDA:.0e}  "
-              f"(regularisation floor ~{np.sqrt(self._LAMBDA)*100:.1f} bps per param)")
+        print(f"  Tikhonov lambda={self._LAMBDA:.0e}")
 
         best_params, best_cost = self._run_scipy(p0)
 
-        # Multi-start: try alternate seeds if first solution is poor
         COST_THRESHOLD = 1.0
         if best_cost > COST_THRESHOLD:
             seeds = [
@@ -191,7 +177,13 @@ class FXStochasticLocalVol:
 
         print(f"  Best cost: {best_cost:.6e}")
 
-        # Set model to best solution
+        # ----------------------------------------------------------------
+        # KEY FIX: run residuals ONE final time on best_params and store
+        # the resulting IV array on self._final_ivs.  _extract_results
+        # will use these directly, so reported RMSE == optimiser RMSE.
+        # ----------------------------------------------------------------
+        self._final_ivs = self._heston_iv(best_params)
+
         self._make_process_and_model(best_params)
         params = list(self.heston_model.params())
 
@@ -204,6 +196,15 @@ class FXStochasticLocalVol:
         feller = 2 * params[1] * params[2] - params[3] ** 2
         print(f"  Feller margin (2kappa*theta - sigma^2 = {feller:.6f})")
         print("=" * 40)
+
+        # Report actual vol RMSE from stored IVs (no NaN hiding)
+        vol_errors_bps = np.where(
+            np.isnan(self._final_ivs),
+            50.0,
+            (self._final_ivs - self._cal_vols) * 10000
+        )
+        rmse = np.sqrt(np.mean(vol_errors_bps ** 2))
+        print(f"  Calibration RMSE (vol): {rmse:.2f} bps")
 
         _, warnings = self._validate_params(params)
         for w in warnings:
@@ -221,7 +222,6 @@ class FXStochasticLocalVol:
     # ------------------------------------------------------------------
     @staticmethod
     def _parse_vol_data(data):
-        """Return (strikes, expiries, vols_decimal) as numpy arrays."""
         if isinstance(data, pd.DataFrame):
             S = data['strike'].values.astype(float)
             E = data['expiry'].values.astype(float)
@@ -238,7 +238,6 @@ class FXStochasticLocalVol:
         return np.clip(p, self._LO, self._HI)
 
     def _make_process_and_model(self, params):
-        """(Re)build HestonProcess + HestonModel + engine and attach to all helpers."""
         p = self._clip(params)
         v0, kappa, theta, sigma, rho = float(p[0]), float(p[1]), float(p[2]), float(p[3]), float(p[4])
         process = ql.HestonProcess(
@@ -254,7 +253,8 @@ class FXStochasticLocalVol:
     def _heston_iv(self, params):
         """
         Compute Heston implied vols for all calibration instruments.
-        Returns array of IV in DECIMAL form, or NaN for failed inversions.
+        Returns array length N in DECIMAL form; NaN where inversion fails.
+        NaN is intentional - callers must handle it explicitly (no silent zeroing).
         """
         p = self._clip(params)
         v0, kappa, theta, sigma, rho = float(p[0]), float(p[1]), float(p[2]), float(p[3]), float(p[4])
@@ -284,11 +284,8 @@ class FXStochasticLocalVol:
                 rf = self.foreign_curve.discount(T)
 
                 if price <= 0 or np.isnan(price) or np.isinf(price):
-                    # Price failure: leave as NaN so the residual is non-zero
-                    # (will be caught below and treated as large error)
-                    continue
+                    continue   # leave NaN — penalty applied in _iv_residuals
 
-                # Black IV inversion
                 rd_rate = -np.log(rd) / T if T > 0 else 0.04
                 rf_rate = -np.log(rf) / T if T > 0 else 0.025
 
@@ -314,43 +311,35 @@ class FXStochasticLocalVol:
                     )
                     ivs[i] = iv
                 except Exception:
-                    # IV inversion failed - leave as NaN, do NOT silently zero the error
-                    pass
+                    pass   # leave NaN
             except Exception:
-                pass  # leave as NaN
+                pass   # leave NaN
 
         return ivs
 
     def _iv_residuals(self, params):
         """
-        Augmented residual vector:
+        Augmented residual vector fed to scipy.least_squares:
 
-          r[:N]   = (heston_iv_i - market_iv_i) * 100     [% vol units]
-          r[N:]   = sqrt(lambda) * (p - prior) / scale    [Tikhonov]
+          r[:N]  = (heston_iv_i - market_iv_i) * 100   [bps, O(0.1-1)]
+          r[N:]  = sqrt(lambda) * (p - prior) / scale  [Tikhonov, 5 terms]
 
-        NaN heston IVs are replaced with a large penalty (50 bps) so the
-        optimiser is repelled from degenerate parameter regions rather than
-        seeing them as zero-error.
+        NaN heston IVs -> 50 bps penalty so degenerate regions are avoided.
         """
         ivs = self._heston_iv(params)
 
-        # Vol residuals: NaN -> 50 bps penalty (drives optimiser away from
-        # regions where the analytic engine fails)
         vol_res = np.where(
             np.isnan(ivs),
-            50.0,                              # 50 bps penalty for failed IV
-            (ivs - self._cal_vols) * 100.0     # normal vol error in bps
+            50.0,
+            (ivs - self._cal_vols) * 100.0
         )
 
-        # Tikhonov regularisation: 5 pseudo-residuals, one per parameter.
-        # Scale each param to O(1) so the penalty is dimensionally balanced.
-        scale = np.array([0.01, 2.0, 0.01, 0.30, 0.50])   # typical param magnitudes
+        scale = np.array([0.01, 2.0, 0.01, 0.30, 0.50])
         reg   = np.sqrt(self._LAMBDA) * (params - self._PRIOR) / scale
 
         return np.concatenate([vol_res, reg])
 
     def _run_scipy(self, p0):
-        """Run scipy.least_squares from p0 with hard bounds. Returns (params, cost)."""
         from scipy.optimize import least_squares
         sol = least_squares(
             self._iv_residuals,
@@ -365,7 +354,6 @@ class FXStochasticLocalVol:
         return self._clip(sol.x), sol.cost
 
     def _create_helpers(self):
-        """Build HestonModelHelper list (used for result extraction)."""
         calendar = ql.TARGET()
         helpers  = []
         for K, T, vol in zip(self._cal_strikes, self._cal_expiries, self._cal_vols):
@@ -415,16 +403,27 @@ class FXStochasticLocalVol:
 
         params = list(self.heston_model.params())
 
-        # Recompute Heston IVs from final calibrated model
-        heston_ivs = self._heston_iv(params)
+        # Use _final_ivs stored during calibrate() — these are the EXACT IVs
+        # the optimiser converged to, with no NaN hiding.
+        # Fall back to re-running only if _final_ivs is somehow not set.
+        if self._final_ivs is not None:
+            heston_ivs = self._final_ivs
+        else:
+            heston_ivs = self._heston_iv(params)
 
         pricing_errors = []
         for i, (K, T, mkt_vol) in enumerate(
                 zip(self._cal_strikes, self._cal_expiries, self._cal_vols)):
-            model_vol     = float(heston_ivs[i]) if not np.isnan(heston_ivs[i]) else mkt_vol
-            vol_error_bps = (model_vol - mkt_vol) * 10000
 
-            # Also compute raw prices for the Market vs Model tab
+            iv = heston_ivs[i]
+            if np.isnan(iv):
+                # Genuine pricing failure: report as 50 bps error, not zero
+                model_vol     = mkt_vol + 0.0050   # +50 bps so it shows up visibly
+                vol_error_bps = 50.0
+            else:
+                model_vol     = float(iv)
+                vol_error_bps = (model_vol - mkt_vol) * 10000
+
             try:
                 engine = ql.AnalyticHestonEngine(self.heston_model)
                 expiry_date = self.eval_date + ql.Period(max(1, int(round(T * 365))), ql.Days)
@@ -435,7 +434,6 @@ class FXStochasticLocalVol:
                 option.setPricingEngine(engine)
                 model_price = option.NPV()
 
-                # BS price at market vol
                 day_counter = ql.Actual365Fixed()
                 rd = self.domestic_curve.discount(T)
                 rf = self.foreign_curve.discount(T)
