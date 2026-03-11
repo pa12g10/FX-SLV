@@ -10,7 +10,7 @@ class CCYSwapPricer:
     Convention: pay EUR ESTR flat, receive USD SOFR + basis spread.
     EUR notional resets at prevailing spot each coupon date (MtM reset).
 
-    create_ql_helper() produces a ql.CrossCurrencyBasisSwapRateHelper
+    create_ql_helper() produces a ql.MtMCrossCurrencyBasisSwapRateHelper
     for ql.PiecewiseLogLinearDiscount bootstrapping.
     """
 
@@ -25,45 +25,54 @@ class CCYSwapPricer:
 
     def create_ql_helper(self, tenor, basis_spread_bps,
                          usd_curve_handle, eur_curve_handle,
-                         fx_spot_handle=None,        # unused by this helper; kept for API compat
+                         fx_spot_handle=None,        # unused; kept for API compat
                          calendar=None, bdc=ql.ModifiedFollowing,
                          end_of_month=True,
                          settlement_days=2):
         """
-        Create a ql.CrossCurrencyBasisSwapRateHelper.
+        Create a ql.MtMCrossCurrencyBasisSwapRateHelper.
 
-        Correct QL signature (QuantLib >= 1.15)
-        ----------------------------------------
-        CrossCurrencyBasisSwapRateHelper(
-            basis,                               # QuoteHandle - spread in decimal
-            tenor,                               # Period
-            fixingDays,                          # int
-            calendar,                            # Calendar
-            convention,                          # BusinessDayConvention
-            endOfMonth,                          # bool
-            baseCurrencyIndex,                   # IborIndex  (USD - known curve)
-            quoteCurrencyIndex,                  # IborIndex  (EUR - being bootstrapped)
-            collateralCurve,                     # YieldTermStructureHandle (USD discount)
-            isFxBaseCurrencyCollateralCurrency,  # bool: True  (USD is base of EUR/USD)
-            isBasisOnFxBaseCurrencyLeg,          # bool: False (basis on EUR/quote leg)
+        Correct QL class and signature (QuantLib >= 1.31 pip bindings)
+        ---------------------------------------------------------------
+        MtMCrossCurrencyBasisSwapRateHelper(
+            basis,              # QuoteHandle  - spread in decimal
+            tenor,              # Period
+            fixingDays,         # int
+            calendar,           # Calendar
+            convention,         # BusinessDayConvention
+            endOfMonth,         # bool
+            baseIndex,          # OvernightIndex / IborIndex (USD - base)
+            otherIndex,         # IborIndex               (EUR - bootstrapped)
+            collateralCurve,    # YieldTermStructureHandle (USD - known)
+            baseIsCollateral,   # bool  True  = USD is both base and collateral
+            basisOnBase,        # bool  False = basis is on the EUR/other leg
+            baseResets,         # bool  False = USD notional resets (std EUR/USD)
+            frequency,          # ql.Frequency  e.g. ql.Quarterly
         )
 
-        The EUR basis curve is bootstrapped by attaching a
-        RelinkableYieldTermStructureHandle to the quoteCurrencyIndex;
-        QL relinks it internally during the bootstrap.
-
-        Market convention for EUR/USD
-        -----------------------------
-        - FX base currency = USD  -> isFxBaseCurrencyCollateralCurrency = True
-        - Basis quoted on EUR leg -> isBasisOnFxBaseCurrencyLeg = False
+        USD/EUR market convention
+        -------------------------
+        - USD is the base currency of the EUR/USD pair AND the collateral
+          -> baseIsCollateral = True
+        - Basis is quoted on the EUR (other) leg, not USD
+          -> basisOnBase = False
+        - Standard MtM reset is on the USD (base) notional
+          -> baseResets = False  (i.e. the *other*/EUR leg resets)
+          NOTE: in QL's MtM helper, baseResets=False means the base
+          notional is fixed and the *other* (EUR) notional resets.
+          This matches standard EUR/USD MtM convention.
         - Quoted basis is negative (EUR trades at a discount vs CIP)
+
+        The EUR basis curve is bootstrapped via a
+        RelinkableYieldTermStructureHandle attached to the EUR index;
+        QL relinks it iteratively during the bootstrap.
 
         Parameters
         ----------
         tenor : str  e.g. '2Y', '5Y', '10Y', '30Y'
         basis_spread_bps : float  Basis spread in bps (negative for EUR/USD)
-        usd_curve_handle : ql.YieldTermStructureHandle  USD discount (known)
-        eur_curve_handle : ql.YieldTermStructureHandle  EUR ESTR discount
+        usd_curve_handle : ql.YieldTermStructureHandle  USD SOFR (known)
+        eur_curve_handle : ql.YieldTermStructureHandle  EUR ESTR (bootstrapped)
         fx_spot_handle   : ignored (kept for call-site API compatibility)
         """
         if calendar is None:
@@ -78,32 +87,29 @@ class CCYSwapPricer:
 
         period = self._parse_tenor(tenor)
 
-        # Ibor indices tied to the respective discount curves.
-        # USDLibor(3M) / Euribor3M are the standard QL proxies;
-        # with OIS discounting the index projection curve doesn't affect
-        # bootstrapping - only the discount curves matter.
-        usd_ibor = ql.USDLibor(ql.Period('3M'), usd_curve_handle)
+        # USD base index: SOFR OvernightIndex tied to the known USD curve
+        sofr_index = ql.Sofr(usd_curve_handle)
 
-        # EUR: attach a relinkable handle so QL can relink during bootstrap
+        # EUR other index: Euribor3M with a relinkable handle so QL can
+        # relink the curve being bootstrapped at each pillar
         eur_relinkable = ql.RelinkableYieldTermStructureHandle()
         eur_relinkable.linkTo(eur_curve_handle.currentLink())
-        eur_ibor = ql.Euribor3M(eur_relinkable)
+        euribor_index = ql.Euribor3M(eur_relinkable)
 
-        # collateralCurve = USD (the known/collateral leg in EUR/USD)
-        # isFxBaseCurrencyCollateralCurrency = True   (USD is base of EUR/USD)
-        # isBasisOnFxBaseCurrencyLeg         = False  (basis on EUR quote leg)
-        helper = ql.CrossCurrencyBasisSwapRateHelper(
+        helper = ql.MtMCrossCurrencyBasisSwapRateHelper(
             basis_quote,
             period,
             settlement_days,
             calendar,
             bdc,
             end_of_month,
-            usd_ibor,           # baseCurrencyIndex  (USD - known)
-            eur_ibor,           # quoteCurrencyIndex (EUR - bootstrapped)
-            usd_curve_handle,   # collateralCurve    (USD discount)
-            True,               # isFxBaseCurrencyCollateralCurrency
-            False,              # isBasisOnFxBaseCurrencyLeg
+            sofr_index,          # baseIndex  (USD - known)
+            euribor_index,       # otherIndex (EUR - bootstrapped)
+            usd_curve_handle,    # collateralCurve (USD)
+            True,                # baseIsCollateral
+            False,               # basisOnBase  (basis on EUR/other leg)
+            False,               # baseResets   (EUR notional resets)
+            ql.Quarterly,        # frequency
         )
         return helper
 
