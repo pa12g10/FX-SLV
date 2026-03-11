@@ -125,13 +125,16 @@ def get_fx_spot():
 
 def get_fx_swap_data():
     """
-    Get FX Swap market data (O/N through 18M).
+    Get FX Swap market data (O/N through 2Y).
 
     With SOFR ~3.65% and ESTR ~2.43%, the USD-EUR rate differential
     is ~122bps - EUR trades at a forward DISCOUNT so forward points are NEGATIVE.
 
     Forward point approximation: pts ~= spot x (r_USD - r_EUR) x T
-    1M: 1.1616 x 0.0122 x (1/12) x 10000 ~= 11.8 pips
+    1M:  1.1616 x 0.0122 x (1/12) x 10000 ~= 11.8 pips
+    18M: 1.1616 x 0.0122 x 1.5   x 10000 ~= 212 pips (market wider due to basis)
+    2Y:  linear extrapolation from 18M ~= -314 pips; basis-adjusted ~= -312 pips
+         consistent with 2Y CCY swap basis of -22.5 bps.
     """
     spot = get_fx_spot()['rate']
     data = [
@@ -148,8 +151,12 @@ def get_fx_swap_data():
         ["6M",   -84.5,  round(spot - 0.008450, 5), "Actual/360"],
         ["9M",  -124.5,  round(spot - 0.012450, 5), "Actual/360"],
         ["12M", -163.0,  round(spot - 0.016300, 5), "Actual/360"],
-        # -- Last FX swap pillar before xccy swaps --
         ["18M", -238.5,  round(spot - 0.023850, 5), "Actual/360"],
+        # -- 2Y bridge pillar: smooths the seam to the first CCY swap at 2Y -22.5bps --
+        # CIP forward (2Y SOFR 3.38%, ESTR 2.52%): F = 1.1616 * exp(0.0086*2) = 1.1817
+        # Basis-adjusted (~-22bps over 2Y adds ~25 pips): outright ~ 1.1842
+        # => forward points = (1.1842 - 1.1616) * 10000 = -312 pips (negative = EUR discount)
+        ["2Y",  -312.0,  round(spot - 0.031200, 5), "Actual/360"],
     ]
     return pd.DataFrame(data, columns=['tenor', 'points', 'outright', 'day_count'])
 
