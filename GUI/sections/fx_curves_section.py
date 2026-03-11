@@ -253,6 +253,10 @@ def render_fx_curves_section():
     if st.session_state.fx_curves is not None:
         fx_curves = st.session_state.fx_curves
 
+        # ── tenor grid: 0.25Y → 30Y at quarterly resolution (120 points) ──
+        tenors = np.linspace(0.25, 30, 120)
+        forward_curve = fx_curves.get_forward_curve(tenors)
+
         fwd_tab1, fwd_tab2, fwd_tab3, fwd_tab4 = st.tabs([
             "Zero Rates", "Discount Factors", "Forward FX Curve", "Basis Impact"
         ])
@@ -290,9 +294,7 @@ def render_fx_curves_section():
             st.plotly_chart(fig_df, use_container_width=True)
 
         with fwd_tab3:
-            tenors = np.linspace(0.25, 10, 40)
-            forward_curve = fx_curves.get_forward_curve(tenors)
-            st.dataframe(forward_curve.head(20), use_container_width=True, hide_index=True)
+            st.dataframe(forward_curve, use_container_width=True, hide_index=True)
             fig_fwd = go.Figure()
             fig_fwd.add_trace(go.Scatter(
                 x=forward_curve['Tenor (Years)'], y=forward_curve['Standard Forward'],
@@ -302,14 +304,16 @@ def render_fx_curves_section():
             fig_fwd.add_trace(go.Scatter(
                 x=forward_curve['Tenor (Years)'], y=forward_curve['Adjusted Forward'],
                 mode='lines+markers', name='Basis-Adjusted Forward',
-                line=dict(width=3, color='green'), marker=dict(size=6)
+                line=dict(width=3, color='green'), marker=dict(size=4)
             ))
             fig_fwd.add_hline(y=fx_curves.spot_fx, line_dash='dot', line_color='black',
                               annotation_text=f"Spot {fx_curves.spot_fx:.4f}")
-            fig_fwd.update_layout(title='EUR/USD Forward Curve (Basis-Adjusted)', height=500,
-                                  hovermode='x unified',
-                                  xaxis=dict(title_text='Tenor (Years)', **AXIS_STYLE),
-                                  yaxis=dict(title_text='EUR/USD FX Rate', **AXIS_STYLE))
+            fig_fwd.update_layout(
+                title='EUR/USD Forward Curve (Basis-Adjusted)',
+                height=550, hovermode='x unified',
+                xaxis=dict(title_text='Tenor (Years)', **AXIS_STYLE),
+                yaxis=dict(title_text='EUR/USD FX Rate', **AXIS_STYLE)
+            )
             st.plotly_chart(fig_fwd, use_container_width=True)
 
         with fwd_tab4:
@@ -317,16 +321,16 @@ def render_fx_curves_section():
             fig_bi.add_trace(go.Scatter(
                 x=forward_curve['Tenor (Years)'], y=forward_curve['Basis (bps)'],
                 mode='lines+markers', name='Basis Spread',
-                line=dict(width=3, color='darkorange'), marker=dict(size=8), yaxis='y1'
+                line=dict(width=3, color='darkorange'), marker=dict(size=4), yaxis='y1'
             ))
             fig_bi.add_trace(go.Scatter(
                 x=forward_curve['Tenor (Years)'], y=forward_curve['Basis Impact (pips)'],
                 mode='lines+markers', name='Impact on Forward (pips)',
-                line=dict(width=3, color='purple'), marker=dict(size=8), yaxis='y2'
+                line=dict(width=3, color='purple'), marker=dict(size=4), yaxis='y2'
             ))
             fig_bi.update_layout(
                 title='CCY Basis and Impact on FX Forwards',
-                height=500, hovermode='x unified',
+                height=550, hovermode='x unified',
                 xaxis=dict(title_text='Tenor (Years)', **AXIS_STYLE),
                 yaxis=dict(title_text='Basis Spread (bps)',
                            title_font=dict(color='black'),
