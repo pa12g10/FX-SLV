@@ -35,13 +35,29 @@ class CCYSwapPricer:
 
         QuantLib convention
         -------------------
-        CrossCurrencyBasisSwapRateHelper bootstraps the *foreign* (EUR)
-        discount curve given the domestic (USD) discount curve and the
-        quoted basis spread. The helper solves for the EUR discount factor
-        that makes each MtM CCY swap reprice at par.
+        Full QL signature:
+            CrossCurrencyBasisSwapRateHelper(
+                basis,              # QuoteHandle - basis spread (decimal)
+                tenor,              # Period
+                settlementDays,     # int
+                calendar,           # Calendar
+                bdc,                # BusinessDayConvention
+                endOfMonth,         # bool
+                baseCcyIdx,         # OvernightIndex  <- USD (KNOWN curve)
+                baseCcyDiscountCurve,  # YieldTermStructureHandle  <- USD discount
+                quoteCcyIdx,        # OvernightIndex  <- EUR (curve being BOOTSTRAPPED)
+                quoteCcyDiscountCurve, # YieldTermStructureHandle  <- EUR discount
+                fxSpot,             # QuoteHandle
+                resettingNotional,  # bool
+            )
 
-        The curve being bootstrapped is the EUR *basis* discount curve
-        (EUR ESTR + basis), not the flat EUR ESTR curve.
+        base  = USD: the currency whose discount curve is already KNOWN.
+        quote = EUR: the currency whose discount curve is being BOOTSTRAPPED.
+
+        Passing eur_curve_handle as quoteCcyDiscountCurve is REQUIRED so that
+        QL builds a *relative* curve on top of EUR ESTR; without it QL was
+        bootstrapping the USD side and producing 1/df instead of df, causing
+        the EUR basis curve to slope steeply downward.
 
         Parameters
         ----------
@@ -50,9 +66,9 @@ class CCYSwapPricer:
         basis_spread_bps : float
             Quoted basis spread in basis points (negative for EUR/USD)
         usd_curve_handle : ql.YieldTermStructureHandle
-            USD SOFR discount curve
+            USD SOFR discount curve (base - known)
         eur_curve_handle : ql.YieldTermStructureHandle
-            EUR ESTR discount curve (flat, no basis)
+            EUR ESTR discount curve (quote - being bootstrapped)
         fx_spot_handle : ql.QuoteHandle, optional
             EUR/USD spot handle (defaults to self.spot_fx)
         calendar : ql.Calendar, optional
@@ -82,18 +98,8 @@ class CCYSwapPricer:
 
         period = self._parse_tenor(tenor)
 
-        # ql.CrossCurrencyBasisSwapRateHelper signature:
-        # (basis, tenor, settlementDays, calendar, bdc, endOfMonth,
-        #  baseCcyIdx, baseCcyDiscountCurve,
-        #  quoteCcyIdx, quoteCcyDiscountCurve,
-        #  fxSpot, resettingNotional=True)
-        #
-        # base  = USD (the currency whose curve is KNOWN = usd_curve_handle)
-        # quote = EUR (the curve being BOOTSTRAPPED)
-        #
-        # Both OIS indices are used only for their tenor/day-count;
-        # we pass flat proxies tied to the known discount curves.
-
+        # base  = USD (known)  -> usd_ois_idx + usd_curve_handle
+        # quote = EUR (bootstrapped) -> eur_ois_idx + eur_curve_handle
         usd_ois_idx = ql.OvernightIndex(
             'SOFR', settlement_days, ql.USDCurrency(),
             ql.UnitedStates(ql.UnitedStates.FederalReserve),
@@ -111,9 +117,10 @@ class CCYSwapPricer:
             calendar,
             bdc,
             end_of_month,
-            usd_ois_idx,          # base ccy index (known curve)
-            usd_curve_handle,     # base ccy discount
-            eur_ois_idx,          # quote ccy index (being bootstrapped)
+            usd_ois_idx,          # base  ccy index  (USD - known)
+            usd_curve_handle,     # base  ccy discount curve (USD)
+            eur_ois_idx,          # quote ccy index  (EUR - bootstrapped)
+            eur_curve_handle,     # quote ccy discount curve (EUR)  <-- FIX: was missing
             fx_spot_handle,
             is_resetting_notional,
         )

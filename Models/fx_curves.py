@@ -18,6 +18,11 @@
 #
 # 3. Calibration errors via helper.impliedQuote() - helper.quote().value()
 #    (same pattern as YieldCurveBuilder)
+#
+# Key QL convention for CrossCurrencyBasisSwapRateHelper:
+#   base  = USD  (curve is KNOWN  -> usd_curve_handle passed as baseCcyDiscount)
+#   quote = EUR  (curve being BOOTSTRAPPED -> eur_curve_handle passed as quoteCcyDiscount)
+# Without quoteCcyDiscount the helper bootstraps USD, not EUR, yielding 1/df.
 
 import QuantLib as ql
 import numpy as np
@@ -105,8 +110,12 @@ class FXCurves:
     def bootstrap_basis_curve(self):
         """
         Bootstrap the EUR basis discount curve using:
-          - ql.FxSwapRateHelper           for FX swap tenors (1W - 18M)
-          - ql.CrossCurrencyBasisSwapRateHelper  for CCY swap tenors (2Y - 30Y)
+          - ql.FxSwapRateHelper                    for FX swap tenors (1W - 18M)
+          - ql.CrossCurrencyBasisSwapRateHelper    for CCY swap tenors (2Y - 30Y)
+
+        QL base/quote convention:
+          base  = USD (known curve)     -> usd_curve_handle
+          quote = EUR (bootstrapped)    -> eur_curve_handle
 
         Output: self.eur_basis_curve  (ql.PiecewiseLogLinearDiscount)
         """
@@ -164,9 +173,12 @@ class FXCurves:
                 else:
                     print(f"  {tenor:<6}  SKIP (duplicate pillar {pillar})")
             except Exception as exc:
-                print(f"  {tenor:<6}  ERROR: {exc}")
+                print(f"  {tenor:<6}  ERROR building FX Swap helper: {exc}")
 
         # ---- CCY SWAP helpers (long end) ----
+        # FIX: eur_curve_handle is now correctly passed as quoteCcyDiscountCurve
+        # inside ccy_swap_pricer.create_ql_helper() so QL bootstraps EUR (quote)
+        # given USD (base), not the other way around.
         print("\nAdding CCY Swap helpers (ql.CrossCurrencyBasisSwapRateHelper):")
         for _, row in self.ccy_swaps_data.iterrows():
             tenor     = row['tenor']
@@ -192,7 +204,13 @@ class FXCurves:
                 else:
                     print(f"  {tenor:<6}  SKIP (duplicate pillar {pillar})")
             except Exception as exc:
-                print(f"  {tenor:<6}  ERROR: {exc}")
+                print(f"  {tenor:<6}  ERROR building CCY Swap helper: {exc}")
+                # Record the failed helper in meta so calibration errors report it
+                self._helper_meta.append({
+                    'label':           f"CCY Swap {tenor}",
+                    'instrument_type': 'CCY Swaps',
+                    'build_error':     str(exc),
+                })
 
         # ---- Bootstrap ----
         print(f"\nBootstrapping with {len(self._helpers)} helpers...")
@@ -229,6 +247,10 @@ class FXCurves:
         FX Swaps  : quote = forward points (F-S); unit = price, error in bps
         CCY Swaps : quote = basis spread (decimal); error in bps
 
+        Failed helpers (build errors or impliedQuote exceptions) are reported
+        with NaN values so they appear in the output rather than being silently
+        dropped.
+
         Returns
         -------
         pandas.DataFrame
@@ -238,23 +260,41 @@ class FXCurves:
             raise ValueError("Basis curve not bootstrapped yet.")
 
         rows = []
-        for helper, meta in zip(self._helpers, self._helper_meta):
+
+        # Index into self._helpers by counting only entries without build_error
+        helper_idx = 0
+        for meta in self._helper_meta:
+            # Skip meta entries that represent failed builds (no helper object)
+            if 'build_error' in meta:
+                rows.append({
+                    'instrument':      meta['label'],
+                    'instrument_type': meta['instrument_type'],
+                    'market_rate':     float('nan'),
+                    'model_rate':      float('nan'),
+                    'error_bps':       float('nan'),
+                    'note':            f"build error: {meta['build_error']}",
+                })
+                continue
+
+            helper = self._helpers[helper_idx]
+            helper_idx += 1
+            inst   = meta['instrument_type']
+
             try:
                 mkt   = helper.quote().value()
                 model = helper.impliedQuote()
-                inst  = meta['instrument_type']
 
                 if inst == 'FX Swaps':
-                    # quotes are in forward-point units (outright - spot)
-                    # convert error to bps (1 pip = 0.0001 -> 1 bps proxy)
-                    error_bps    = (model - mkt) * 10_000
-                    market_disp  = mkt   * 10_000   # display in pips
-                    model_disp   = model * 10_000
+                    # quotes in forward-point units (outright - spot)
+                    # convert to pips for display; error in bps proxy
+                    error_bps   = (model - mkt) * 10_000
+                    market_disp = mkt   * 10_000
+                    model_disp  = model * 10_000
                 else:
                     # quotes are decimal basis spreads
-                    error_bps    = (model - mkt) * 10_000
-                    market_disp  = mkt   * 10_000   # display in bps
-                    model_disp   = model * 10_000
+                    error_bps   = (model - mkt) * 10_000
+                    market_disp = mkt   * 10_000
+                    model_disp  = model * 10_000
 
                 rows.append({
                     'instrument':      meta['label'],
@@ -262,17 +302,21 @@ class FXCurves:
                     'market_rate':     market_disp,
                     'model_rate':      model_disp,
                     'error_bps':       error_bps,
+                    'note':            '',
                 })
             except Exception as exc:
                 rows.append({
                     'instrument':      meta['label'],
-                    'instrument_type': meta['instrument_type'],
+                    'instrument_type': inst,
                     'market_rate':     float('nan'),
                     'model_rate':      float('nan'),
                     'error_bps':       float('nan'),
+                    'note':            f"impliedQuote error: {exc}",
                 })
 
-        return pd.DataFrame(rows).dropna(subset=['error_bps'])
+        df = pd.DataFrame(rows)
+        # Return all rows; caller can filter on error_bps.isna() to find failures
+        return df
 
     # ------------------------------------------------------------------
     # CURVE OUTPUT METHODS
@@ -282,6 +326,12 @@ class FXCurves:
         """
         Basis-adjusted FX forward using the bootstrapped EUR basis curve.
         F = spot * df_eur_basis / df_usd
+
+        With USD SOFR > EUR ESTR, df_usd < df_eur at all tenors, so
+        the standard forward is above spot (EUR appreciates in fwd terms).
+        The basis-adjusted forward adds the negative EUR/USD xccy basis,
+        which reduces the EUR discount factor slightly, so the adjusted
+        forward should be a touch below the standard forward.
         """
         if self.eur_basis_curve is None:
             raise ValueError("Basis curve not bootstrapped yet.")
