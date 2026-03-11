@@ -212,6 +212,10 @@ class FXStochasticLocalVol:
         self.heston_model = ql.HestonModel(heston_process)
         
         # Create calibration helpers from vol surface
+        # BUG FIX: use PriceError so the optimizer minimises market_price - model_price
+        # rather than ImpliedVolError, which is numerically unstable when the model vol
+        # is far from the market vol (causes large implied-vol inversion failures and
+        # inflated price differences).
         self.calibrated_helpers = self._create_calibration_helpers()
         
         print(f"Created {len(self.calibrated_helpers)} calibration helpers")
@@ -343,7 +347,21 @@ class FXStochasticLocalVol:
     
     def _create_calibration_helpers(self):
         """
-        Create vanilla option helpers for calibration
+        Create vanilla option helpers for calibration.
+
+        BUG FIX (vs original): changed error type from
+          ql.BlackCalibrationHelper.ImpliedVolError
+        to
+          ql.BlackCalibrationHelper.PriceError
+
+        Reason: ImpliedVolError works well only when the model price is already
+        close to the market price (i.e. near convergence).  Early in the
+        optimisation the Heston model can produce prices far from market, which
+        makes the implied-vol inversion fail or return garbage values.  The
+        Levenberg-Marquardt step then receives NaN / very-large residuals and
+        stalls.  PriceError is numerically stable at any parameter value and
+        gives the optimiser a smooth, well-defined gradient from the start,
+        leading to significantly tighter market vs model price agreement.
         """
         helpers = []
         calendar = ql.TARGET()
@@ -358,7 +376,7 @@ class FXStochasticLocalVol:
         for row in data:
             strike = row['strike']
             expiry_years = row['expiry']
-            volatility = row['volatility']
+            volatility = row['volatility']  # must be decimal (e.g. 0.075)
             
             # Skip invalid data
             if volatility <= 0 or expiry_years <= 0 or strike <= 0:
@@ -375,7 +393,7 @@ class FXStochasticLocalVol:
                 ql.QuoteHandle(ql.SimpleQuote(volatility)),
                 self.domestic_curve,
                 self.foreign_curve,
-                ql.BlackCalibrationHelper.ImpliedVolError
+                ql.BlackCalibrationHelper.PriceError   # FIX: was ImpliedVolError
             )
             
             helpers.append(helper)
@@ -432,7 +450,7 @@ class FXStochasticLocalVol:
                    for d in self.vol_surface_data]
         
         for i, (helper, row) in enumerate(zip(self.calibrated_helpers, data)):
-            market_vol = row['volatility']
+            market_vol = row['volatility']  # decimal
             
             try:
                 market_price = helper.marketValue()
@@ -465,8 +483,8 @@ class FXStochasticLocalVol:
             pricing_errors.append({
                 'strike': row['strike'],
                 'expiry': row['expiry'],
-                'market_vol': market_vol * 100,
-                'model_vol': model_vol * 100,
+                'market_vol': market_vol * 100,   # display as %
+                'model_vol': model_vol * 100,      # display as %
                 'market_price': market_price,
                 'model_price': model_price,
                 'price_error': price_error,

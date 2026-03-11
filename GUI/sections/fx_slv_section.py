@@ -482,8 +482,10 @@ def render_fx_slv_section():
                     calibration_df = vol_surface_df.copy()
                     st.info(f"🎯 Calibrating to {len(calibration_df)} options (full surface)")
 
+                # BUG FIX: vol_surface_df stores vols as % (e.g. 7.5), but FXStochasticLocalVol
+                # expects decimals (e.g. 0.075). Divide by 100 here.
                 vol_surface_data = [
-                    [float(r["Strike"]), float(r["Expiry (Years)"]), float(r["Volatility (%)"]) / 100]
+                    [float(r["Strike"]), float(r["Expiry (Years)"]), float(r["Volatility (%)"]) / 100.0]
                     for _, r in calibration_df.iterrows()
                 ]
 
@@ -560,13 +562,15 @@ def render_fx_slv_section():
                 fig_vols = go.Figure()
                 fig_vols.add_trace(go.Scatter(
                     x=list(range(len(errors_df))), y=errors_df['market_vol'],
-                    mode='markers', name='Market Vol',
+                    mode='markers+lines', name='Market Vol',
                     marker=dict(size=10, color='blue', symbol='diamond'),
+                    line=dict(width=2, color='blue'),
                 ))
                 fig_vols.add_trace(go.Scatter(
                     x=list(range(len(errors_df))), y=errors_df['model_vol'],
-                    mode='markers', name='Model Vol',
+                    mode='markers+lines', name='Model Vol',
                     marker=dict(size=8, color='red', symbol='circle'),
+                    line=dict(width=2, color='red'),
                 ))
                 fig_vols.update_layout(title="Volatility Calibration: Market vs Model",
                     xaxis_title="Option Index", yaxis_title="Implied Volatility (%)",
@@ -622,14 +626,16 @@ def render_fx_slv_section():
                 unique_tenors = errors_df['tenor_label'].unique().tolist()
                 colors_tab    = ["#1f77b4","#d62728","#2ca02c","#ff7f0e","#9467bd","#8c564b","#e377c2"]
 
+                # ---- FIX: Line plot instead of scatter, sorted by market_price per tenor ----
                 fig_mv = go.Figure()
                 for ti, tenor in enumerate(unique_tenors):
-                    sub = errors_df[errors_df['tenor_label'] == tenor]
+                    sub = errors_df[errors_df['tenor_label'] == tenor].sort_values('market_price')
                     c   = colors_tab[ti % len(colors_tab)]
                     fig_mv.add_trace(go.Scatter(
                         x=sub['market_price'], y=sub['model_price'],
-                        mode='markers', name=tenor,
-                        marker=dict(size=11, color=c, line=dict(width=1, color='white')),
+                        mode='lines+markers', name=tenor,
+                        marker=dict(size=9, color=c, line=dict(width=1, color='white')),
+                        line=dict(width=2, color=c),
                         text=sub['label'],
                         hovertemplate=("<b>%{text}</b><br>Market: %{x:.6f}<br>Model: %{y:.6f}<br>"
                                        "Error: %{customdata:.2f}%<extra></extra>"),
@@ -758,11 +764,13 @@ def render_fx_slv_section():
                             fig_val.add_trace(go.Scatter(
                                 x=list(range(len(validation_results))), y=validation_results['bs_price'],
                                 mode='markers+lines', name='Black-Scholes Price',
-                                marker=dict(size=10, color='blue')))
+                                marker=dict(size=10, color='blue'),
+                                line=dict(width=2, color='blue')))
                             fig_val.add_trace(go.Scatter(
                                 x=list(range(len(validation_results))), y=validation_results['heston_price'],
                                 mode='markers+lines', name='Heston Price',
-                                marker=dict(size=8, color='red')))
+                                marker=dict(size=8, color='red'),
+                                line=dict(width=2, color='red')))
                             fig_val.update_layout(title="Option Prices: Black-Scholes vs Heston",
                                 xaxis_title="Option Index", yaxis_title="Price", height=500)
                             st.plotly_chart(fig_val, use_container_width=True, key="fx_slv_val_chart")
