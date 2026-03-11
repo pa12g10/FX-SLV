@@ -14,13 +14,9 @@
 #    Both segments consistently produce df_eur_basis < df_eur
 #    => adjusted_forward < standard_forward (correct for negative EUR/USD basis)
 #
-# 3. Interpolation: PiecewiseCubicZero
-#    Cubic spline on zero rates gives C2 continuity across pillars,
-#    smoothing through the FX-swap / CCY-swap seam at 18M->2Y.
-#
-# 4. Basis spread display: (zr_eur_basis - zr_eur_flat) * 10000
+# 3. Basis spread display: (zr_eur_basis - zr_eur_flat) * 10000
 #    => should read ~-20 to -29 bps in the long end
-#    => short end driven by FX swap implied basis
+#    => short end driven by FX swap implied basis (~-120 bps at 1Y)
 
 import QuantLib as ql
 import numpy as np
@@ -42,7 +38,7 @@ class FXCurves:
     Produces:
     - self.usd_curve         : ql.PiecewiseLogLinearDiscount  (USD SOFR)
     - self.eur_curve         : ql.PiecewiseLogLinearDiscount  (EUR ESTR, flat)
-    - self.eur_basis_curve   : ql.PiecewiseCubicZero          (EUR ESTR + basis)
+    - self.eur_basis_curve   : ql.PiecewiseLogLinearDiscount  (EUR ESTR + basis)
     """
 
     def __init__(self, eval_date):
@@ -93,11 +89,7 @@ class FXCurves:
 
     def bootstrap_basis_curve(self):
         """
-        Bootstrap the EUR basis discount curve using PiecewiseCubicZero.
-
-        Cubic spline interpolation on zero rates ensures C2 continuity
-        across all pillars, smoothing the 18M->2Y seam between FX swap
-        and CCY swap instruments.
+        Bootstrap the EUR basis discount curve.
 
         FX Swap helpers: is_fx_base_currency_collateral_currency=True
             USD is collateral; QL bootstraps EUR dfs from forward points.
@@ -111,7 +103,7 @@ class FXCurves:
             raise ValueError("Call bootstrap_domestic_curves() first.")
 
         print("\n" + "="*60)
-        print("BOOTSTRAPPING CCY BASIS CURVE (QL - PiecewiseCubicZero)")
+        print("BOOTSTRAPPING CCY BASIS CURVE (QL)")
         print("="*60)
 
         fx_spot_data          = get_fx_spot()
@@ -187,10 +179,7 @@ class FXCurves:
                                           'build_error': str(exc)})
 
         print(f"\nBootstrapping with {len(self._helpers)} helpers...")
-
-        # PiecewiseCubicZero: cubic spline on zero rates, C2 continuity,
-        # smooths the kink at the FX-swap / CCY-swap seam (18M -> 2Y).
-        self.eur_basis_curve = ql.PiecewiseCubicZero(
+        self.eur_basis_curve = ql.PiecewiseLogLinearDiscount(
             self.eval_date, self._helpers, ql.Actual360()
         )
         self.eur_basis_curve.enableExtrapolation()
@@ -262,7 +251,8 @@ class FXCurves:
         """
         F_adj = spot * df_eur_basis / df_usd
         basis_spread_bps = (zr_eur_basis - zr_eur_flat) * 10_000
-            => negative since zr_basis > zr_flat when df_basis < df_flat.
+            => negative (~-20 to -120 bps) since zr_basis > zr_flat
+               when df_basis < df_flat.
         """
         if self.eur_basis_curve is None:
             raise ValueError("Basis curve not bootstrapped yet.")
