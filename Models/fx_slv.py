@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import sys
 import os
+import traceback as _tb
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -12,38 +13,17 @@ class FXStochasticLocalVol:
     """
     FX Stochastic Local Volatility Model.
 
-    Calibration design
-    ------------------
-    We calibrate in IMPLIED-VOL space using a direct scipy least_squares call.
-    Residuals are augmented with a small Tikhonov regularisation term that
-    penalises deviation from a 'prior' parameter set.  This serves two purposes:
-
-      1. It prevents the optimiser from over-fitting a smooth surface to
-         numerical precision (RMSE -> 0), producing a more realistic
-         calibration residual (~5-15 bps) that reflects the true model
-         limitations of a single 5-parameter Heston.
-
-      2. It regularises the ill-posed inverse problem, improving stability
-         across different market regimes and initial guesses.
-
-    Key fix (zero-RMSE bug)
-    -----------------------
-    Previously _extract_results called _heston_iv() again on final params,
-    and any NaN IV was silently replaced with mkt_vol -> zero error.
-    Now the FINAL IV array from the optimiser's last residual evaluation is
-    stored on self._final_ivs and used directly in _extract_results, so
-    the reported errors are exactly the errors the optimiser converged to.
+    No silent fallbacks policy
+    --------------------------
+    Every failure is logged to stdout with a full description.
+    NaN values propagate to the output DataFrame so failures are visible.
+    No variable is ever silently set to a placeholder (0.0, 0.07, etc.).
     """
 
-    # Hard parameter bounds  [v0, kappa, theta, sigma, rho]
-    _LO = np.array([1e-4,  0.10, 1e-4, 0.05, -0.95])
-    _HI = np.array([0.0625, 15.0, 0.0625, 1.50,  0.95])
-
-    # Tikhonov regularisation weight. Increase to raise RMSE floor.
+    _LO    = np.array([1e-4,  0.10, 1e-4, 0.05, -0.95])
+    _HI    = np.array([0.0625, 15.0, 0.0625, 1.50,  0.95])
     _LAMBDA = 1e-3
-
-    # Prior parameter set (centre of regularisation penalty)
-    _PRIOR = np.array([0.0042, 1.5, 0.0056, 0.30, -0.30])
+    _PRIOR  = np.array([0.0042, 1.5, 0.0056, 0.30, -0.30])
 
     def __init__(self, eval_date, spot_fx, domestic_curve, foreign_curve,
                  vol_surface_data, model_params=None):
@@ -68,20 +48,15 @@ class FXStochasticLocalVol:
 
         self._cal_strikes  = None
         self._cal_expiries = None
-        self._cal_vols     = None   # decimal
-
-        # Stores the FINAL heston IV array from the last optimiser call.
-        # Used by _extract_results so reported errors = optimiser errors exactly.
-        self._final_ivs = None
+        self._cal_vols     = None
+        self._final_ivs    = None   # IVs at convergence, set by calibrate()
 
     # ------------------------------------------------------------------
     # PUBLIC API
     # ------------------------------------------------------------------
     def build_vol_surface(self):
-        """Build BlackVarianceSurface for Dupire local vol layer."""
         calendar    = ql.TARGET()
         day_counter = ql.Actual365Fixed()
-
         S, E, V = self._parse_vol_data(self.vol_surface_data)
 
         expiry_set = sorted(set(E.tolist()))
@@ -94,18 +69,17 @@ class FXStochasticLocalVol:
             extra = expiry_set[0] + 0.01
             expiry_set = sorted(expiry_set + [extra])
             for s in strike_set:
-                S = np.append(S, s);  E = np.append(E, extra);  V = np.append(V, V[0])
+                S = np.append(S, s); E = np.append(E, extra); V = np.append(V, V[0])
         if len(strike_set) < 2:
             extra = strike_set[0] * 1.01
             strike_set = sorted(strike_set + [extra])
             for e in expiry_set:
-                S = np.append(S, extra);  E = np.append(E, e);  V = np.append(V, V[0])
+                S = np.append(S, extra); E = np.append(E, e); V = np.append(V, V[0])
 
         expiry_dates = [
             self.eval_date + ql.Period(max(1, int(round(e * 365))), ql.Days)
             for e in expiry_set
         ]
-
         vol_matrix = ql.Matrix(len(strike_set), len(expiry_set))
         for i, strike in enumerate(strike_set):
             for j, expiry in enumerate(expiry_set):
@@ -116,7 +90,13 @@ class FXStochasticLocalVol:
                     ei   = np.argmin(np.abs(np.array(expiry_set) - expiry))
                     emsk = np.abs(E - expiry_set[ei]) < 1e-6
                     si   = np.argmin(np.abs(S[emsk] - strike)) if emsk.any() else 0
-                    vol_matrix[i][j] = float(V[emsk][si]) if emsk.any() else 0.07
+                    if emsk.any():
+                        vol_matrix[i][j] = float(V[emsk][si])
+                    else:
+                        raise RuntimeError(
+                            f"Cannot fill vol matrix at strike={strike}, expiry={expiry}: "
+                            "no nearby point found. Check input vol data."
+                        )
 
         self.black_var_surface = ql.BlackVarianceSurface(
             self.eval_date, calendar, expiry_dates, strike_set, vol_matrix, day_counter
@@ -138,20 +118,18 @@ class FXStochasticLocalVol:
         self._make_process_and_model(self._clip(np.array([
             self.model_params['v0'],    self.model_params['kappa'],
             self.model_params['theta'], self.model_params['sigma'],
-            self.model_params['rho']
+            self.model_params['rho'],
         ])))
         self.calibrated_helpers = self._create_helpers()
         print(f"  Helpers: {len(self.calibrated_helpers)}")
-
         if len(self.calibrated_helpers) == 0:
-            raise RuntimeError("No calibration helpers constructed - check vol data.")
+            raise RuntimeError("No calibration helpers constructed — check vol data.")
 
         p0 = self._clip(np.array([
             self.model_params['v0'],    self.model_params['kappa'],
             self.model_params['theta'], self.model_params['sigma'],
-            self.model_params['rho']
+            self.model_params['rho'],
         ]))
-
         print(f"\nInitial Heston params:")
         print(f"  v0={p0[0]:.6f} ({np.sqrt(p0[0])*100:.2f}% vol)  kappa={p0[1]:.4f}  "
               f"theta={p0[2]:.6f} ({np.sqrt(p0[2])*100:.2f}% vol)  "
@@ -160,13 +138,12 @@ class FXStochasticLocalVol:
 
         best_params, best_cost = self._run_scipy(p0)
 
-        COST_THRESHOLD = 1.0
-        if best_cost > COST_THRESHOLD:
+        if best_cost > 1.0:
             seeds = [
-                [0.0042,  2.0,   0.0056,  0.40,  -0.50],
-                [0.0056,  1.0,   0.0056,  0.20,  -0.20],
-                [0.0030,  3.0,   0.0042,  0.50,  -0.40],
-                [0.0056,  1.5,   0.0072,  0.35,  -0.30],
+                [0.0042, 2.0,  0.0056, 0.40, -0.50],
+                [0.0056, 1.0,  0.0056, 0.20, -0.20],
+                [0.0030, 3.0,  0.0042, 0.50, -0.40],
+                [0.0056, 1.5,  0.0072, 0.35, -0.30],
             ]
             for seed in seeds:
                 p_seed = self._clip(np.array(seed, dtype=float))
@@ -177,12 +154,14 @@ class FXStochasticLocalVol:
 
         print(f"  Best cost: {best_cost:.6e}")
 
-        # ----------------------------------------------------------------
-        # KEY FIX: run residuals ONE final time on best_params and store
-        # the resulting IV array on self._final_ivs.  _extract_results
-        # will use these directly, so reported RMSE == optimiser RMSE.
-        # ----------------------------------------------------------------
+        # Store final IVs at convergence — _extract_results uses these directly
         self._final_ivs = self._heston_iv(best_params)
+
+        n_nan = int(np.isnan(self._final_ivs).sum())
+        if n_nan > 0:
+            print(f"  WARNING: {n_nan}/{len(self._final_ivs)} instruments have NaN IV "
+                  f"after calibration — IV inversion failed for those strikes. "
+                  f"Check Heston price range vs market strikes.")
 
         self._make_process_and_model(best_params)
         params = list(self.heston_model.params())
@@ -194,17 +173,16 @@ class FXStochasticLocalVol:
         print(f"  sigma = {params[3]:.6f}")
         print(f"  rho   = {params[4]:.6f}")
         feller = 2 * params[1] * params[2] - params[3] ** 2
-        print(f"  Feller margin (2kappa*theta - sigma^2 = {feller:.6f})")
+        print(f"  Feller margin: 2kappa*theta - sigma^2 = {feller:.6f}")
         print("=" * 40)
 
-        # Report actual vol RMSE from stored IVs (no NaN hiding)
-        vol_errors_bps = np.where(
-            np.isnan(self._final_ivs),
-            50.0,
-            (self._final_ivs - self._cal_vols) * 10000
-        )
-        rmse = np.sqrt(np.mean(vol_errors_bps ** 2))
-        print(f"  Calibration RMSE (vol): {rmse:.2f} bps")
+        valid_mask = ~np.isnan(self._final_ivs)
+        if valid_mask.any():
+            vol_errors_bps = (self._final_ivs[valid_mask] - self._cal_vols[valid_mask]) * 10000
+            rmse = np.sqrt(np.mean(vol_errors_bps ** 2))
+            print(f"  Calibration RMSE (vol, {valid_mask.sum()} instruments): {rmse:.2f} bps")
+        else:
+            print("  ERROR: All IV inversions failed — RMSE cannot be computed.")
 
         _, warnings = self._validate_params(params)
         for w in warnings:
@@ -230,12 +208,20 @@ class FXStochasticLocalVol:
             arr = np.array(data, dtype=float)
             S, E, V = arr[:, 0], arr[:, 1], arr[:, 2]
         if V.max() > 2.0:
-            print(f"  WARNING: vols look like % (max={V.max():.1f}), dividing by 100")
+            print(f"  WARNING: vols appear to be in % (max={V.max():.1f}), dividing by 100")
             V = V / 100.0
         return S, E, V
 
     def _clip(self, p):
         return np.clip(p, self._LO, self._HI)
+
+    def _rate_from_discount(self, discount, T, label):
+        """Convert discount factor to continuously-compounded rate. Raises if inputs are invalid."""
+        if T <= 0:
+            raise ValueError(f"T must be > 0 for rate extraction ({label}), got T={T}")
+        if discount <= 0 or np.isnan(discount) or np.isinf(discount):
+            raise ValueError(f"Invalid discount factor {discount} for {label} at T={T}")
+        return -np.log(discount) / T
 
     def _make_process_and_model(self, params):
         p = self._clip(params)
@@ -253,8 +239,10 @@ class FXStochasticLocalVol:
     def _heston_iv(self, params):
         """
         Compute Heston implied vols for all calibration instruments.
-        Returns array length N in DECIMAL form; NaN where inversion fails.
-        NaN is intentional - callers must handle it explicitly (no silent zeroing).
+
+        Returns array length N in DECIMAL form.
+        NaN means IV inversion failed for that instrument — every failure is
+        logged to stdout with reason. No value is silently substituted.
         """
         p = self._clip(params)
         v0, kappa, theta, sigma, rho = float(p[0]), float(p[1]), float(p[2]), float(p[3]), float(p[4])
@@ -273,6 +261,13 @@ class FXStochasticLocalVol:
         for i, (K, T, vol_mkt) in enumerate(
                 zip(self._cal_strikes, self._cal_expiries, self._cal_vols)):
             try:
+                if T <= 0:
+                    print(f"  [IV] SKIP i={i} K={K:.5f}: T={T} <= 0")
+                    continue
+                if K <= 0:
+                    print(f"  [IV] SKIP i={i} T={T:.4f}: K={K} <= 0")
+                    continue
+
                 expiry_date = self.eval_date + ql.Period(max(1, int(round(T * 365))), ql.Days)
                 payoff      = ql.PlainVanillaPayoff(ql.Option.Call, float(K))
                 exercise    = ql.EuropeanExercise(expiry_date)
@@ -280,26 +275,26 @@ class FXStochasticLocalVol:
                 option.setPricingEngine(engine)
                 price = option.NPV()
 
-                rd = self.domestic_curve.discount(T)
-                rf = self.foreign_curve.discount(T)
+                if price is None or np.isnan(price) or np.isinf(price):
+                    print(f"  [IV] FAIL i={i} K={K:.5f} T={T:.4f}: Heston price={price} (NaN/Inf)")
+                    continue
+                if price <= 0:
+                    print(f"  [IV] FAIL i={i} K={K:.5f} T={T:.4f}: Heston price={price:.6f} <= 0")
+                    continue
 
-                if price <= 0 or np.isnan(price) or np.isinf(price):
-                    continue   # leave NaN — penalty applied in _iv_residuals
-
-                rd_rate = -np.log(rd) / T if T > 0 else 0.04
-                rf_rate = -np.log(rf) / T if T > 0 else 0.025
+                rd_df = self.domestic_curve.discount(T)
+                rf_df = self.foreign_curve.discount(T)
+                rd_rate = self._rate_from_discount(rd_df, T, f"domestic i={i}")
+                rf_rate = self._rate_from_discount(rf_df, T, f"foreign i={i}")
 
                 bs_proc = ql.BlackScholesMertonProcess(
                     self.spot_handle,
                     ql.YieldTermStructureHandle(
-                        ql.FlatForward(self.eval_date, rf_rate, day_counter)
-                    ),
+                        ql.FlatForward(self.eval_date, rf_rate, day_counter)),
                     ql.YieldTermStructureHandle(
-                        ql.FlatForward(self.eval_date, rd_rate, day_counter)
-                    ),
+                        ql.FlatForward(self.eval_date, rd_rate, day_counter)),
                     ql.BlackVolTermStructureHandle(
-                        ql.BlackConstantVol(self.eval_date, calendar, vol_mkt, day_counter)
-                    )
+                        ql.BlackConstantVol(self.eval_date, calendar, vol_mkt, day_counter))
                 )
                 option2 = ql.VanillaOption(payoff, exercise)
                 option2.setPricingEngine(ql.AnalyticEuropeanEngine(bs_proc))
@@ -310,33 +305,25 @@ class FXStochasticLocalVol:
                         minVol=0.001, maxVol=2.0
                     )
                     ivs[i] = iv
-                except Exception:
-                    pass   # leave NaN
-            except Exception:
-                pass   # leave NaN
+                except Exception as e_iv:
+                    print(f"  [IV] FAIL i={i} K={K:.5f} T={T:.4f}: impliedVolatility error: {e_iv} "
+                          f"(Heston price={price:.6f}, mkt_vol={vol_mkt*100:.2f}%)")
+            except Exception as e_outer:
+                print(f"  [IV] FAIL i={i} K={K:.5f} T={T:.4f}: outer error: {e_outer}")
 
         return ivs
 
     def _iv_residuals(self, params):
         """
-        Augmented residual vector fed to scipy.least_squares:
-
-          r[:N]  = (heston_iv_i - market_iv_i) * 100   [bps, O(0.1-1)]
-          r[N:]  = sqrt(lambda) * (p - prior) / scale  [Tikhonov, 5 terms]
-
-        NaN heston IVs -> 50 bps penalty so degenerate regions are avoided.
+        Augmented residual vector:
+          r[:N]  = (heston_iv_i - market_iv_i) * 100   [% vol units]
+          r[N:]  = sqrt(lambda) * (p - prior) / scale  [Tikhonov]
+        NaN IVs -> 50 bps penalty (logged by _heston_iv above).
         """
-        ivs = self._heston_iv(params)
-
-        vol_res = np.where(
-            np.isnan(ivs),
-            50.0,
-            (ivs - self._cal_vols) * 100.0
-        )
-
-        scale = np.array([0.01, 2.0, 0.01, 0.30, 0.50])
-        reg   = np.sqrt(self._LAMBDA) * (params - self._PRIOR) / scale
-
+        ivs     = self._heston_iv(params)
+        vol_res = np.where(np.isnan(ivs), 50.0, (ivs - self._cal_vols) * 100.0)
+        scale   = np.array([0.01, 2.0, 0.01, 0.30, 0.50])
+        reg     = np.sqrt(self._LAMBDA) * (params - self._PRIOR) / scale
         return np.concatenate([vol_res, reg])
 
     def _run_scipy(self, p0):
@@ -358,6 +345,7 @@ class FXStochasticLocalVol:
         helpers  = []
         for K, T, vol in zip(self._cal_strikes, self._cal_expiries, self._cal_vols):
             if vol <= 0 or T <= 0 or K <= 0:
+                print(f"  [helpers] SKIP K={K} T={T} vol={vol}: non-positive value")
                 continue
             period = ql.Period(max(1, int(round(T * 365))), ql.Days)
             h = ql.HestonModelHelper(
@@ -372,6 +360,7 @@ class FXStochasticLocalVol:
 
     def _build_local_vol_surface(self):
         if self.black_var_surface is None:
+            print("  [local vol] Skipped: black_var_surface not built.")
             return None
         try:
             bv_handle = ql.BlackVolTermStructureHandle(self.black_var_surface)
@@ -380,7 +369,8 @@ class FXStochasticLocalVol:
             )
             self.local_vol_surface.enableExtrapolation()
         except Exception as e:
-            print(f"  Warning local vol surface: {e}")
+            print(f"  [local vol] FAILED: {e}")
+            print(_tb.format_exc())
             self.local_vol_surface = None
         return self.local_vol_surface
 
@@ -388,13 +378,14 @@ class FXStochasticLocalVol:
         v0, kappa, theta, sigma, rho = params
         warnings = []
         if any(np.isnan(p) or np.isinf(p) for p in params):
-            return False, ["NaN/Inf in params"]
+            return False, ["NaN/Inf in calibrated params"]
         if v0 <= 0 or kappa <= 0 or theta <= 0 or sigma <= 0:
-            return False, ["Non-positive parameter"]
+            return False, ["Non-positive parameter after calibration"]
         if abs(rho) >= 1.0:
             return False, ["|rho| >= 1"]
         if 2 * kappa * theta <= sigma**2:
-            warnings.append(f"Feller violated: 2kappa*theta={2*kappa*theta:.5f} <= sigma^2={sigma**2:.5f}")
+            warnings.append(
+                f"Feller violated: 2kappa*theta={2*kappa*theta:.5f} <= sigma^2={sigma**2:.5f}")
         return True, warnings
 
     def _extract_results(self):
@@ -403,27 +394,29 @@ class FXStochasticLocalVol:
 
         params = list(self.heston_model.params())
 
-        # Use _final_ivs stored during calibrate() — these are the EXACT IVs
-        # the optimiser converged to, with no NaN hiding.
-        # Fall back to re-running only if _final_ivs is somehow not set.
-        if self._final_ivs is not None:
-            heston_ivs = self._final_ivs
-        else:
-            heston_ivs = self._heston_iv(params)
+        # Use IVs stored at convergence — never re-run with silent NaN hiding
+        heston_ivs = self._final_ivs if self._final_ivs is not None else self._heston_iv(params)
 
+        day_counter = ql.Actual365Fixed()
         pricing_errors = []
+
         for i, (K, T, mkt_vol) in enumerate(
                 zip(self._cal_strikes, self._cal_expiries, self._cal_vols)):
 
             iv = heston_ivs[i]
             if np.isnan(iv):
-                # Genuine pricing failure: report as 50 bps error, not zero
-                model_vol     = mkt_vol + 0.0050   # +50 bps so it shows up visibly
-                vol_error_bps = 50.0
+                # IV inversion already logged in _heston_iv — store NaN visibly
+                model_vol_pct = float('nan')
+                vol_error_bps = float('nan')
             else:
-                model_vol     = float(iv)
-                vol_error_bps = (model_vol - mkt_vol) * 10000
+                model_vol_pct = float(iv) * 100
+                vol_error_bps = (float(iv) - mkt_vol) * 10000
 
+            # Price comparison
+            model_price  = float('nan')
+            market_price = float('nan')
+            price_error  = float('nan')
+            price_error_pct = float('nan')
             try:
                 engine = ql.AnalyticHestonEngine(self.heston_model)
                 expiry_date = self.eval_date + ql.Period(max(1, int(round(T * 365))), ql.Days)
@@ -433,12 +426,15 @@ class FXStochasticLocalVol:
                 )
                 option.setPricingEngine(engine)
                 model_price = option.NPV()
+                if np.isnan(model_price) or np.isinf(model_price):
+                    print(f"  [results] i={i} K={K:.5f} T={T:.4f}: model_price={model_price} (NaN/Inf)")
+                    model_price = float('nan')
+            except Exception as e:
+                print(f"  [results] i={i} K={K:.5f} T={T:.4f}: model pricing failed: {e}")
 
-                day_counter = ql.Actual365Fixed()
-                rd = self.domestic_curve.discount(T)
-                rf = self.foreign_curve.discount(T)
-                rd_rate = -np.log(rd) / T if T > 0 and rd > 0 else 0.04
-                rf_rate = -np.log(rf) / T if T > 0 and rf > 0 else 0.025
+            try:
+                rd_rate = self._rate_from_discount(self.domestic_curve.discount(T), T, f"domestic i={i}")
+                rf_rate = self._rate_from_discount(self.foreign_curve.discount(T),  T, f"foreign i={i}")
                 bs_proc = ql.BlackScholesMertonProcess(
                     self.spot_handle,
                     ql.YieldTermStructureHandle(
@@ -448,23 +444,27 @@ class FXStochasticLocalVol:
                     ql.BlackVolTermStructureHandle(
                         ql.BlackConstantVol(self.eval_date, ql.TARGET(), mkt_vol, day_counter))
                 )
+                expiry_date = self.eval_date + ql.Period(max(1, int(round(T * 365))), ql.Days)
                 option2 = ql.VanillaOption(
                     ql.PlainVanillaPayoff(ql.Option.Call, float(K)),
                     ql.EuropeanExercise(expiry_date)
                 )
                 option2.setPricingEngine(ql.AnalyticEuropeanEngine(bs_proc))
-                market_price    = option2.NPV()
-                price_error     = model_price - market_price
-                price_error_pct = (price_error / market_price * 100) if market_price > 1e-10 else 0.0
-            except Exception:
-                market_price = model_price = 0.0
-                price_error  = price_error_pct = 0.0
+                market_price = option2.NPV()
+                if not np.isnan(model_price) and not np.isnan(market_price):
+                    price_error = model_price - market_price
+                    if market_price > 1e-10:
+                        price_error_pct = price_error / market_price * 100
+                    else:
+                        print(f"  [results] i={i} K={K:.5f} T={T:.4f}: market_price={market_price:.8f} too small for pct error")
+            except Exception as e:
+                print(f"  [results] i={i} K={K:.5f} T={T:.4f}: market pricing failed: {e}")
 
             pricing_errors.append({
                 'strike':          float(K),
                 'expiry':          float(T),
-                'market_vol':      mkt_vol   * 100,
-                'model_vol':       model_vol * 100,
+                'market_vol':      mkt_vol * 100,
+                'model_vol':       model_vol_pct,
                 'market_price':    market_price,
                 'model_price':     model_price,
                 'price_error':     price_error,
@@ -484,18 +484,23 @@ class FXStochasticLocalVol:
     # ------------------------------------------------------------------
     def get_simulated_paths(self, num_paths=1000, time_steps=252, horizon_years=1.0):
         if not self.heston_model:
-            return None, None, None, None
+            raise RuntimeError("Model not calibrated — call calibrate() first.")
 
         total_steps = int(time_steps * horizon_years)
         times = np.linspace(0, horizon_years, total_steps + 1)
         dt    = horizon_years / total_steps
 
         p     = self.heston_model.params()
-        v0    = max(1e-4, p[0])
-        kappa = max(0.01, p[1])
-        theta = max(1e-4, p[2])
-        sigma = max(0.01, abs(p[3]))
-        rho   = float(np.clip(p[4], -0.99, 0.99))
+        v0    = float(p[0])
+        kappa = float(p[1])
+        theta = float(p[2])
+        sigma = float(p[3])
+        rho   = float(p[4])
+
+        if v0 <= 0 or kappa <= 0 or theta <= 0 or sigma <= 0:
+            raise ValueError(f"Invalid Heston params for simulation: v0={v0} kappa={kappa} theta={theta} sigma={sigma}")
+        if abs(rho) >= 1.0:
+            raise ValueError(f"Invalid rho={rho} for simulation")
 
         rd = self.domestic_curve.zeroRate(horizon_years / 2, ql.Continuous).rate()
         rf = self.foreign_curve.zeroRate(horizon_years / 2, ql.Continuous).rate()
@@ -523,67 +528,67 @@ class FXStochasticLocalVol:
 
     def validate_option_prices(self, test_options=None):
         if not self.heston_model:
-            return None
+            raise RuntimeError("Model not calibrated — call calibrate() first.")
 
         if test_options is None:
             if self._cal_strikes is not None:
-                n = min(5, len(self._cal_strikes))
-                idx = np.linspace(0, len(self._cal_strikes)-1, n, dtype=int)
-                test_options = [[self._cal_strikes[i], self._cal_expiries[i], 'call'] for i in idx]
+                n   = min(5, len(self._cal_strikes))
+                idx = np.linspace(0, len(self._cal_strikes) - 1, n, dtype=int)
+                test_options = [[self._cal_strikes[j], self._cal_expiries[j], 'call'] for j in idx]
             else:
-                return None
+                raise RuntimeError("No test_options provided and no calibration data available.")
 
         calendar    = ql.TARGET()
         day_counter = ql.Actual365Fixed()
         results     = []
 
         for strike, expiry, opt_type in test_options:
-            try:
-                ql.Settings.instance().evaluationDate = self.eval_date
-                expiry_date = self.eval_date + ql.Period(max(1, int(round(expiry * 365))), ql.Days)
-                payoff  = ql.PlainVanillaPayoff(
-                    ql.Option.Call if opt_type.lower() == 'call' else ql.Option.Put, float(strike)
+            ql.Settings.instance().evaluationDate = self.eval_date
+            expiry_date = self.eval_date + ql.Period(max(1, int(round(expiry * 365))), ql.Days)
+            payoff  = ql.PlainVanillaPayoff(
+                ql.Option.Call if opt_type.lower() == 'call' else ql.Option.Put, float(strike)
+            )
+            exercise = ql.EuropeanExercise(expiry_date)
+
+            option = ql.VanillaOption(payoff, exercise)
+            option.setPricingEngine(ql.AnalyticHestonEngine(self.heston_model))
+            heston_price = option.NPV()
+
+            # Find market vol from calibration data — no hardcoded fallback
+            if self._cal_strikes is None:
+                raise RuntimeError("No calibration data to look up market vol for validation.")
+            mask = ((np.abs(self._cal_strikes - strike) < 1e-5) &
+                    (np.abs(self._cal_expiries - expiry) < 1e-5))
+            if not mask.any():
+                print(f"  [validate] SKIP K={strike} T={expiry}: no matching calibration instrument found")
+                continue
+            market_vol = float(self._cal_vols[mask][0])
+
+            rd_rate = self._rate_from_discount(self.domestic_curve.discount(expiry), expiry, f"domestic K={strike}")
+            rf_rate = self._rate_from_discount(self.foreign_curve.discount(expiry),  expiry, f"foreign K={strike}")
+
+            bs_proc = ql.BlackScholesMertonProcess(
+                self.spot_handle,
+                ql.YieldTermStructureHandle(ql.FlatForward(self.eval_date, rf_rate, day_counter)),
+                ql.YieldTermStructureHandle(ql.FlatForward(self.eval_date, rd_rate, day_counter)),
+                ql.BlackVolTermStructureHandle(
+                    ql.BlackConstantVol(self.eval_date, calendar, market_vol, day_counter)
                 )
-                exercise = ql.EuropeanExercise(expiry_date)
+            )
+            option2 = ql.VanillaOption(payoff, exercise)
+            option2.setPricingEngine(ql.AnalyticEuropeanEngine(bs_proc))
+            bs_price = option2.NPV()
 
-                option = ql.VanillaOption(payoff, exercise)
-                option.setPricingEngine(ql.AnalyticHestonEngine(self.heston_model))
-                heston_price = option.NPV()
-
-                market_vol = 0.07
-                if self._cal_strikes is not None:
-                    mask = (np.abs(self._cal_strikes - strike) < 1e-5) & \
-                           (np.abs(self._cal_expiries - expiry) < 1e-5)
-                    if mask.any():
-                        market_vol = float(self._cal_vols[mask][0])
-
-                rd = self.domestic_curve.discount(expiry)
-                rf = self.foreign_curve.discount(expiry)
-                rd_rate = -np.log(rd) / expiry if expiry > 0 and rd > 0 else 0.04
-                rf_rate = -np.log(rf) / expiry if expiry > 0 and rf > 0 else 0.025
-
-                bs_proc = ql.BlackScholesMertonProcess(
-                    self.spot_handle,
-                    ql.YieldTermStructureHandle(ql.FlatForward(self.eval_date, rf_rate, day_counter)),
-                    ql.YieldTermStructureHandle(ql.FlatForward(self.eval_date, rd_rate, day_counter)),
-                    ql.BlackVolTermStructureHandle(
-                        ql.BlackConstantVol(self.eval_date, calendar, market_vol, day_counter)
-                    )
-                )
-                option2 = ql.VanillaOption(payoff, exercise)
-                option2.setPricingEngine(ql.AnalyticEuropeanEngine(bs_proc))
-                bs_price = option2.NPV()
-
-                diff = heston_price - bs_price
-                results.append({
-                    'strike': strike, 'expiry': expiry, 'type': opt_type,
-                    'market_vol':     market_vol * 100,
-                    'bs_price':       bs_price,
-                    'heston_price':   heston_price,
-                    'price_diff':     diff,
-                    'price_diff_pct': (diff / bs_price * 100) if bs_price > 1e-10 else 0.0,
-                })
-            except Exception as e:
-                print(f"  Validation skip K={strike} T={expiry}: {e}")
+            diff = heston_price - bs_price
+            results.append({
+                'strike':         strike,
+                'expiry':         expiry,
+                'type':           opt_type,
+                'market_vol':     market_vol * 100,
+                'bs_price':       bs_price,
+                'heston_price':   heston_price,
+                'price_diff':     diff,
+                'price_diff_pct': (diff / bs_price * 100) if bs_price > 1e-10 else float('nan'),
+            })
 
         return pd.DataFrame(results) if results else None
