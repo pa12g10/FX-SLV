@@ -304,13 +304,9 @@ def _plot_smile_overlay(errors_df, instruments_df, tenor="1Y"):
         asks_mkt.append(float(r.iloc[0].get("Ask Vol (%)", r.iloc[0]["Market Vol (%)"] + 0.18)))
         htexts.append(pillar)
 
-    # Map Heston model vols back to delta pillar x-positions by matching
-    # calibrated strikes to the pillar strikes computed from market vols.
-    # This ensures the red line sits exactly over the blue when error = 0.
     edf_t = errors_df[np.abs(errors_df["expiry"] - T_val) < 1e-4].copy()
     edf_t = edf_t.sort_values("strike").reset_index(drop=True)
 
-    # Build pillar -> Heston model vol mapping via closest-strike match
     rd_approx, rf_approx = 0.053, 0.035
     xs_mod, ys_mod = [], []
     for pillar in DELTA_PILLAR_ORDER:
@@ -333,6 +329,15 @@ def _plot_smile_overlay(errors_df, instruments_df, tenor="1Y"):
         idx = np.abs(edf_t["strike"].values - K_pillar).argmin()
         xs_mod.append(DELTA_PILLAR_X[pillar])
         ys_mod.append(float(edf_t.iloc[idx]["model_vol"]))
+
+    # -------------------------------------------------------------------
+    # Y-axis range: pad ±2% ABSOLUTE around all data so both smiles sit
+    # in the middle of the chart and the gap between them looks small.
+    # -------------------------------------------------------------------
+    all_vols = ys_mkt + bids_mkt + asks_mkt + ys_mod
+    y_pad    = 2.0   # percentage points of absolute padding
+    y_lo     = max(0.0, min(all_vols) - y_pad)
+    y_hi     = max(all_vols) + y_pad
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -360,7 +365,11 @@ def _plot_smile_overlay(errors_df, instruments_df, tenor="1Y"):
         title=dict(text=f"EUR/USD {tenor} Smile: Market vs Heston (Skew Model)", font=dict(size=16)),
         xaxis=dict(tickmode="array", tickvals=list(DELTA_PILLAR_X.values()),
                    ticktext=DELTA_PILLAR_ORDER, title="Delta Pillar", range=[-0.5,4.5]),
-        yaxis=dict(title="Implied Volatility (%)", ticksuffix="%"),
+        yaxis=dict(
+            title="Implied Volatility (%)",
+            ticksuffix="%",
+            range=[y_lo, y_hi],   # <-- zoomed-out Y axis
+        ),
         height=460, hovermode="closest",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
