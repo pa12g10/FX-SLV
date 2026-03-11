@@ -20,6 +20,8 @@ class YieldCurveBuilder:
         self.currency = currency
         self.curve = None
         self.helpers = []
+        # Track instrument type per helper for calibration error colouring
+        self._helper_meta = []  # list of dicts {label, instrument_type}
         
         ql.Settings.instance().evaluationDate = eval_date
         
@@ -45,6 +47,7 @@ class YieldCurveBuilder:
         print(f"{'='*60}")
         
         self.helpers = []
+        self._helper_meta = []
         used_pillar_dates = set()
         
         # Flat forward used as initial curve for swap helpers
@@ -64,6 +67,7 @@ class YieldCurveBuilder:
             pillar_date = helper.latestDate()
             if pillar_date not in used_pillar_dates:
                 self.helpers.append(helper)
+                self._helper_meta.append({'label': 'Deposit', 'instrument_type': 'Deposit'})
                 used_pillar_dates.add(pillar_date)
                 print(f"  ON @ {deposit_data['rate']:.2f}% -> pillar {pillar_date}")
             else:
@@ -93,6 +97,7 @@ class YieldCurveBuilder:
                 
                 if not too_close:
                     self.helpers.append(helper)
+                    self._helper_meta.append({'label': tenor_label, 'instrument_type': 'Futures'})
                     used_pillar_dates.add(pillar_date)
                     print(f"  {tenor_label} @ {row['price']:.2f} -> pillar {pillar_date}")
             except Exception as e:
@@ -113,6 +118,7 @@ class YieldCurveBuilder:
                 pillar_date = helper.latestDate()
                 if pillar_date not in used_pillar_dates:
                     self.helpers.append(helper)
+                    self._helper_meta.append({'label': f"Swap {row['tenor']}", 'instrument_type': 'Swaps'})
                     used_pillar_dates.add(pillar_date)
                     print(f"  {row['tenor']} @ {row['rate']:.2f}% -> pillar {pillar_date}")
                 else:
@@ -148,6 +154,37 @@ class YieldCurveBuilder:
             print(f"{'='*60}\n")
             raise
     
+    def get_calibration_errors(self):
+        """
+        Return calibration errors (Model Rate - Market Rate) in bps for each
+        bootstrapping instrument, together with instrument type labels.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns: instrument, instrument_type, model_rate, market_rate, error_bps
+        """
+        if self.curve is None:
+            raise ValueError("Curve not bootstrapped yet. Call bootstrap_curve() first.")
+
+        rows = []
+        for helper, meta in zip(self.helpers, self._helper_meta):
+            try:
+                market_rate = helper.quote().value()
+                model_rate  = helper.impliedQuote()
+                error_bps   = (model_rate - market_rate) * 10_000   # bps
+                rows.append({
+                    'instrument':      meta['label'],
+                    'instrument_type': meta['instrument_type'],
+                    'market_rate':     market_rate * 100,   # percent
+                    'model_rate':      model_rate  * 100,   # percent
+                    'error_bps':       error_bps,
+                })
+            except Exception:
+                pass
+
+        return pd.DataFrame(rows)
+
     def _get_max_maturity(self):
         if not self.helpers:
             return 0.0
