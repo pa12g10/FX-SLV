@@ -62,10 +62,10 @@ def render_fx_curves_section():
             f"**Spot EUR/USD:** {get_fx_spot()['rate']:.4f}")
 
     # ================================================================
-    # SECTION 1 — DOMESTIC CURVE CONSTRUCTION (USD SOFR)
+    # SECTION 1 - DOMESTIC CURVE CONSTRUCTION (USD SOFR)
     # ================================================================
     st.markdown("---")
-    st.subheader("1 — Domestic Curve Construction (USD SOFR)")
+    st.subheader("1 - Domestic Curve Construction (USD SOFR)")
 
     dom_tab1, dom_tab2, dom_tab3 = st.tabs(["Deposit", "Futures", "OIS Swaps"])
 
@@ -85,7 +85,7 @@ def render_fx_curves_section():
         )
 
     with dom_tab3:
-        st.write("**SOFR OIS Swaps (2Y – 30Y)**")
+        st.write("**SOFR OIS Swaps (2Y - 30Y)**")
         sofr_sw = get_sofr_swaps_data()
         st.dataframe(sofr_sw, use_container_width=True, hide_index=True)
         st.plotly_chart(
@@ -95,10 +95,10 @@ def render_fx_curves_section():
         )
 
     # ================================================================
-    # SECTION 2 — FOREIGN CURVE CONSTRUCTION (EUR ESTR)
+    # SECTION 2 - FOREIGN CURVE CONSTRUCTION (EUR ESTR)
     # ================================================================
     st.markdown("---")
-    st.subheader("2 — Foreign Curve Construction (EUR ESTR)")
+    st.subheader("2 - Foreign Curve Construction (EUR ESTR)")
 
     for_tab1, for_tab2, for_tab3 = st.tabs(["Deposit", "Futures", "OIS Swaps"])
 
@@ -118,7 +118,7 @@ def render_fx_curves_section():
         )
 
     with for_tab3:
-        st.write("**ESTR OIS Swaps (2Y – 30Y)**")
+        st.write("**ESTR OIS Swaps (2Y - 30Y)**")
         estr_sw = get_estr_swaps_data()
         st.dataframe(estr_sw, use_container_width=True, hide_index=True)
         st.plotly_chart(
@@ -128,12 +128,12 @@ def render_fx_curves_section():
         )
 
     # ================================================================
-    # SECTION 3 — CCY BASIS CURVE CONSTRUCTION
+    # SECTION 3 - CCY BASIS CURVE CONSTRUCTION
     # ================================================================
     st.markdown("---")
-    st.subheader("3 — CCY Basis Curve Construction (EUR/USD)")
+    st.subheader("3 - CCY Basis Curve Construction (EUR/USD)")
 
-    basis_tab1, basis_tab2 = st.tabs(["FX Swaps (O/N – 18M)", "MtM XCcy Swaps (2Y – 30Y)"])
+    basis_tab1, basis_tab2 = st.tabs(["FX Swaps (O/N - 18M)", "MtM XCcy Swaps (2Y - 30Y)"])
 
     with basis_tab1:
         st.write("""
@@ -177,7 +177,7 @@ def render_fx_curves_section():
     with basis_tab2:
         st.write("""
         **Mark-to-Market Cross-Currency Swaps** are the standard long-end instrument.
-        Convention: ESTR flat vs SOFR + basis spread (bps) — the EUR notional resets
+        Convention: ESTR flat vs SOFR + basis spread (bps) - the EUR notional resets
         at prevailing spot each coupon date, removing FX delta so the quoted spread
         is the pure funding basis.
         """)
@@ -208,10 +208,10 @@ def render_fx_curves_section():
         """)
 
     # ================================================================
-    # SECTION 4 — FORWARD CURVE GENERATION
+    # SECTION 4 - FORWARD CURVE GENERATION
     # ================================================================
     st.markdown("---")
-    st.subheader("4 — Forward Curve Generation")
+    st.subheader("4 - Forward Curve Generation")
 
     st.info("""
     Forward FX rates are derived from the domestic (SOFR) and foreign (ESTR) discount
@@ -253,12 +253,12 @@ def render_fx_curves_section():
     if st.session_state.fx_curves is not None:
         fx_curves = st.session_state.fx_curves
 
-        # ── tenor grid: 0.25Y → 30Y at quarterly resolution (120 points) ──
+        # tenor grid: 0.25Y -> 30Y at quarterly resolution (120 points)
         tenors = np.linspace(0.25, 30, 120)
         forward_curve = fx_curves.get_forward_curve(tenors)
 
         fwd_tab1, fwd_tab2, fwd_tab3, fwd_tab4 = st.tabs([
-            "Zero Rates", "Discount Factors", "Forward FX Curve", "Basis Impact"
+            "Zero Rates", "Discount Factors", "Forward FX Curve", "CCY Basis"
         ])
 
         with fwd_tab1:
@@ -317,27 +317,21 @@ def render_fx_curves_section():
             st.plotly_chart(fig_fwd, use_container_width=True)
 
         with fwd_tab4:
-            fig_bi = go.Figure()
-            fig_bi.add_trace(go.Scatter(
+            # Basis spread only - interpolated across the full tenor grid
+            fig_basis_fwd = go.Figure()
+            fig_basis_fwd.add_trace(go.Scatter(
                 x=forward_curve['Tenor (Years)'], y=forward_curve['Basis (bps)'],
-                mode='lines+markers', name='Basis Spread',
-                line=dict(width=3, color='darkorange'), marker=dict(size=4), yaxis='y1'
+                mode='lines+markers', name='EUR/USD CCY Basis',
+                line=dict(width=3, color='darkorange'), marker=dict(size=4)
             ))
-            fig_bi.add_trace(go.Scatter(
-                x=forward_curve['Tenor (Years)'], y=forward_curve['Basis Impact (pips)'],
-                mode='lines+markers', name='Impact on Forward (pips)',
-                line=dict(width=3, color='purple'), marker=dict(size=4), yaxis='y2'
-            ))
-            fig_bi.update_layout(
-                title='CCY Basis and Impact on FX Forwards',
-                height=550, hovermode='x unified',
+            fig_basis_fwd.add_hline(y=0, line_dash='dash', line_color='gray',
+                                    annotation_text='Zero Basis', annotation_position='right')
+            fig_basis_fwd.update_layout(
+                title='EUR/USD CCY Basis Spread (Interpolated)',
+                height=500, hovermode='x unified',
                 xaxis=dict(title_text='Tenor (Years)', **AXIS_STYLE),
-                yaxis=dict(title_text='Basis Spread (bps)',
-                           title_font=dict(color='black'),
-                           tickfont=dict(color='black')),
-                yaxis2=dict(title_text='Impact on Forward (pips)', overlaying='y', side='right',
-                            title_font=dict(color='black'), tickfont=dict(color='black')),
+                yaxis=dict(title_text='Basis Spread (bps)', **AXIS_STYLE),
             )
-            st.plotly_chart(fig_bi, use_container_width=True)
+            st.plotly_chart(fig_basis_fwd, use_container_width=True)
     else:
         st.info("Click 'Bootstrap All Curves & Generate Forwards' above to see results.")
