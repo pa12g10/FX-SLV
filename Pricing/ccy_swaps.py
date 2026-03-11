@@ -7,11 +7,20 @@ class CCYSwapPricer:
     """
     Pricer for Mark-to-Market Cross-Currency Basis Swaps (EUR/USD).
 
-    Convention: pay EUR ESTR flat, receive USD SOFR + basis spread.
-    EUR notional resets at prevailing spot each coupon date (MtM reset).
+    Convention: pay EUR ESTR flat (base), receive USD SOFR + basis spread.
+    USD notional resets at prevailing spot each coupon date (MtM reset).
 
-    create_ql_helper() produces a ql.MtMCrossCurrencyBasisSwapRateHelper
-    for ql.PiecewiseLogLinearDiscount bootstrapping.
+    Market data quote (get_ccy_swaps_data):
+        'ESTR flat vs SOFR + basis'  ->  basis is on the USD/base leg
+
+    MtMCrossCurrencyBasisSwapRateHelper flags for EUR/USD:
+        baseIsCollateral = True   USD is both FX base and collateral
+        basisOnBase      = True   basis is on the USD (base) leg
+        baseResets       = True   USD notional resets each period (standard MtM)
+
+    Effect: bootstrapped EUR basis zero rates sit ABOVE flat ESTR
+    (the negative basis on USD leg is compensated by a higher EUR rate),
+    so df_eur_basis < df_eur and adjusted_forward < standard_forward.
     """
 
     def __init__(self, eval_date, spot_fx):
@@ -32,48 +41,41 @@ class CCYSwapPricer:
         """
         Create a ql.MtMCrossCurrencyBasisSwapRateHelper.
 
-        Correct QL class and signature (QuantLib >= 1.31 pip bindings)
-        ---------------------------------------------------------------
+        QL signature (QuantLib >= 1.31 pip bindings):
+        ----------------------------------------------
         MtMCrossCurrencyBasisSwapRateHelper(
-            basis,              # QuoteHandle  - spread in decimal
-            tenor,              # Period
-            fixingDays,         # int
-            calendar,           # Calendar
-            convention,         # BusinessDayConvention
-            endOfMonth,         # bool
-            baseIndex,          # OvernightIndex / IborIndex (USD - base)
-            otherIndex,         # IborIndex               (EUR - bootstrapped)
-            collateralCurve,    # YieldTermStructureHandle (USD - known)
-            baseIsCollateral,   # bool  True  = USD is both base and collateral
-            basisOnBase,        # bool  False = basis is on the EUR/other leg
-            baseResets,         # bool  False = USD notional resets (std EUR/USD)
-            frequency,          # ql.Frequency  e.g. ql.Quarterly
+            basis,              QuoteHandle  decimal spread
+            tenor,              Period
+            fixingDays,         int
+            calendar,           Calendar
+            convention,         BusinessDayConvention
+            endOfMonth,         bool
+            baseIndex,          OvernightIndex  (USD - known)
+            otherIndex,         IborIndex       (EUR - bootstrapped)
+            collateralCurve,    YieldTermStructureHandle (USD)
+            baseIsCollateral,   bool
+            basisOnBase,        bool
+            baseResets,         bool
+            frequency,          ql.Frequency
         )
 
-        USD/EUR market convention
-        -------------------------
-        - USD is the base currency of the EUR/USD pair AND the collateral
-          -> baseIsCollateral = True
-        - Basis is quoted on the EUR (other) leg, not USD
-          -> basisOnBase = False
-        - Standard MtM reset is on the USD (base) notional
-          -> baseResets = False  (i.e. the *other*/EUR leg resets)
-          NOTE: in QL's MtM helper, baseResets=False means the base
-          notional is fixed and the *other* (EUR) notional resets.
-          This matches standard EUR/USD MtM convention.
-        - Quoted basis is negative (EUR trades at a discount vs CIP)
+        Flag values for EUR/USD 'ESTR flat vs SOFR + basis' convention:
+        -----------------------------------------------------------------
+        baseIsCollateral = True   USD is FX base of EUR/USD AND collateral
+        basisOnBase      = True   basis is on the USD (base) leg
+        baseResets       = True   USD notional resets each period (MtM)
 
-        The EUR basis curve is bootstrapped via a
-        RelinkableYieldTermStructureHandle attached to the EUR index;
-        QL relinks it iteratively during the bootstrap.
+        With basisOnBase=True and a negative basis quote (-22 to -29 bps),
+        the helper bootstraps a EUR curve whose zero rates are HIGHER than
+        flat ESTR (smaller dfs), so adjusted_forward < standard_forward.
 
         Parameters
         ----------
-        tenor : str  e.g. '2Y', '5Y', '10Y', '30Y'
+        tenor            : str    e.g. '2Y', '5Y', '10Y', '30Y'
         basis_spread_bps : float  Basis spread in bps (negative for EUR/USD)
         usd_curve_handle : ql.YieldTermStructureHandle  USD SOFR (known)
         eur_curve_handle : ql.YieldTermStructureHandle  EUR ESTR (bootstrapped)
-        fx_spot_handle   : ignored (kept for call-site API compatibility)
+        fx_spot_handle   : ignored, kept for call-site API compatibility
         """
         if calendar is None:
             calendar = ql.JointCalendar(
@@ -87,11 +89,10 @@ class CCYSwapPricer:
 
         period = self._parse_tenor(tenor)
 
-        # USD base index: SOFR OvernightIndex tied to the known USD curve
+        # USD base index tied to the known USD curve
         sofr_index = ql.Sofr(usd_curve_handle)
 
-        # EUR other index: Euribor3M with a relinkable handle so QL can
-        # relink the curve being bootstrapped at each pillar
+        # EUR other index with relinkable handle so QL relinks during bootstrap
         eur_relinkable = ql.RelinkableYieldTermStructureHandle()
         eur_relinkable.linkTo(eur_curve_handle.currentLink())
         euribor_index = ql.Euribor3M(eur_relinkable)
@@ -103,12 +104,12 @@ class CCYSwapPricer:
             calendar,
             bdc,
             end_of_month,
-            sofr_index,          # baseIndex  (USD - known)
-            euribor_index,       # otherIndex (EUR - bootstrapped)
-            usd_curve_handle,    # collateralCurve (USD)
-            True,                # baseIsCollateral
-            False,               # basisOnBase  (basis on EUR/other leg)
-            False,               # baseResets   (EUR notional resets)
+            sofr_index,          # baseIndex        (USD - known)
+            euribor_index,       # otherIndex       (EUR - bootstrapped)
+            usd_curve_handle,    # collateralCurve  (USD)
+            True,                # baseIsCollateral (USD is base AND collateral)
+            True,                # basisOnBase      (basis on USD/base leg)
+            True,                # baseResets       (USD notional resets - MtM)
             ql.Quarterly,        # frequency
         )
         return helper
@@ -127,8 +128,7 @@ class CCYSwapPricer:
 
         Structure
         ---------
-        - EUR leg: pay floating ESTR on EUR notional (approximated as
-          (df_start/df_end - 1)/T coupons)
+        - EUR leg: pay floating ESTR on EUR notional
         - USD leg: receive floating SOFR + basis on USD notional
         - Initial + final notional exchange
         """
@@ -154,13 +154,11 @@ class CCYSwapPricer:
             s, e   = schedule[i], schedule[i + 1]
             yf     = dc.yearFraction(s, e)
 
-            # EUR floating coupon
             dfs_e  = eur_curve.discount(s)
             dfe_e  = eur_curve.discount(e)
             fwd_e  = (dfs_e / dfe_e - 1.0) / yf
             eur_leg_npv += notional_eur * fwd_e * yf * dfe_e
 
-            # USD floating + basis coupon
             dfs_u  = usd_curve.discount(s)
             dfe_u  = usd_curve.discount(e)
             fwd_u  = (dfs_u / dfe_u - 1.0) / yf
@@ -168,10 +166,7 @@ class CCYSwapPricer:
 
         df_mat_eur = eur_curve.discount(maturity_date)
         df_mat_usd = usd_curve.discount(maturity_date)
-
-        # Final notional re-exchange
         final_npv  = (notional_usd - notional_eur * self.spot_fx) * df_mat_usd
-
         npv_eur_usd = eur_leg_npv * self.spot_fx
         total_npv   = -npv_eur_usd + usd_leg_npv + final_npv
 
@@ -210,10 +205,6 @@ class CCYSwapPricer:
             else:
                 lo = mid
         return (lo + hi) / 2.0
-
-    # ------------------------------------------------------------------
-    # INTERNAL
-    # ------------------------------------------------------------------
 
     def _parse_tenor(self, tenor_str):
         tenor_str = tenor_str.upper().strip()
