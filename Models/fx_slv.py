@@ -50,6 +50,7 @@ class FXStochasticLocalVol:
         self._cal_expiries = None
         self._cal_vols     = None
         self._final_ivs    = None   # IVs at convergence, set by calibrate()
+        self._best_params  = None   # clipped best params, set by calibrate()
 
     # ------------------------------------------------------------------
     # PUBLIC API
@@ -153,6 +154,11 @@ class FXStochasticLocalVol:
                     best_cost, best_params = cost_try, p_try
 
         print(f"  Best cost: {best_cost:.6e}")
+
+        # Always clamp through _clip before storing — guards against
+        # floating-point boundary creep from the optimizer (e.g. sigma = -1e-8)
+        best_params = self._clip(best_params)
+        self._best_params = best_params          # <-- stored for simulation
 
         # Store final IVs at convergence — _extract_results uses these directly
         self._final_ivs = self._heston_iv(best_params)
@@ -492,17 +498,37 @@ class FXStochasticLocalVol:
         times = np.linspace(0, horizon_years, total_steps + 1)
         dt    = horizon_years / total_steps
 
-        p     = self.heston_model.params()
+        # ----------------------------------------------------------------
+        # Always source params from _best_params (clipped at calibration)
+        # rather than heston_model.params() which can return raw optimizer
+        # values that have not been re-clamped after QuantLib stores them.
+        # ----------------------------------------------------------------
+        if self._best_params is not None:
+            raw = self._best_params
+        else:
+            raw = np.array(list(self.heston_model.params()))
+
+        # Re-clip as a final safety net (e.g. sigma = -2.8e-2 -> 0.05)
+        p     = self._clip(raw)
         v0    = float(p[0])
         kappa = float(p[1])
         theta = float(p[2])
         sigma = float(p[3])
         rho   = float(p[4])
 
+        # Log if clipping actually changed anything
+        if not np.allclose(raw, p, atol=1e-10):
+            print(f"  [sim] params clamped before simulation:")
+            print(f"    raw:     v0={float(raw[0]):.8f} kappa={float(raw[1]):.6f} "
+                  f"theta={float(raw[2]):.8f} sigma={float(raw[3]):.8f} rho={float(raw[4]):.6f}")
+            print(f"    clamped: v0={v0:.8f} kappa={kappa:.6f} "
+                  f"theta={theta:.8f} sigma={sigma:.8f} rho={rho:.6f}")
+
         if v0 <= 0 or kappa <= 0 or theta <= 0 or sigma <= 0:
             raise ValueError(
-                f"Invalid Heston params for simulation: "
-                f"v0={v0} kappa={kappa} theta={theta} sigma={sigma}"
+                f"Invalid Heston params for simulation after clamping: "
+                f"v0={v0} kappa={kappa} theta={theta} sigma={sigma}. "
+                f"Try recalibrating with tighter bounds or a different initial guess."
             )
         if abs(rho) >= 1.0:
             raise ValueError(f"Invalid rho={rho} for simulation")
@@ -517,12 +543,14 @@ class FXStochasticLocalVol:
 
         np.random.seed(42)
         dW1 = np.random.normal(0, np.sqrt(dt), (total_steps, num_paths))
-        dW2 = rho * dW1 + np.sqrt(1 - rho**2) * np.random.normal(0, np.sqrt(dt), (total_steps, num_paths))
+        dW2 = rho * dW1 + np.sqrt(1 - rho**2) * np.random.normal(
+            0, np.sqrt(dt), (total_steps, num_paths))
 
         for i in range(1, total_steps + 1):
             v = vol_paths[i-1, :]
             vol_paths[i, :] = np.maximum(
-                v + kappa * (theta - v) * dt + sigma * np.sqrt(np.maximum(v, 0)) * dW2[i-1, :], 1e-4
+                v + kappa * (theta - v) * dt + sigma * np.sqrt(np.maximum(v, 0)) * dW2[i-1, :],
+                1e-4
             )
             spot_paths[i, :] = spot_paths[i-1, :] * np.exp(
                 (rd - rf - 0.5 * v) * dt + np.sqrt(np.maximum(v, 0)) * dW1[i-1, :]
